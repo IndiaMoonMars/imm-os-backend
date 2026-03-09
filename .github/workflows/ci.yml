@@ -1,23 +1,15 @@
 name: IMM OS Backend CI
-
-on:
-  push:
-      branches: [ main ]
-        pull_request:
-            branches: [ main ]
-
-            jobs:
-              lint:
-                  runs-on: ubuntu-latest
-                      steps:
-                            - run: echo "lint (flake8)"
-
-                              test:
-                                  runs-on: ubuntu-latest
-                                      steps:
-                                            - run: echo "test (echo)"
-
-                                              build:
-                                                  runs-on: ubuntu-latest
-                                                      steps:
-                                                            - run: echo "build (echo)"
+on: [push, pull_request]
+jobs:
+  lint:
+      runs-on: ubuntu-latest
+          steps:
+                - run: echo "lint"
+                  test:
+                      runs-on: ubuntu-latest
+                          steps:
+                                - run: echo "test"
+                                  build:
+                                      runs-on: ubuntu-latest
+                                          steps:
+                                                - run: echo "build"
