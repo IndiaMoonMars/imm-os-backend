@@ -1,15 +1,19 @@
 name: IMM OS Backend CI
-on: [push, pull_request]
-jobs:
+on: [push, pull_request]branch_protection_rule: jobs:
   lint:
       runs-on: ubuntu-latest
           steps:
-                - run: echo "lint"
-                  test:
-                      runs-on: ubuntu-latest
-                          steps:
-                                - run: echo "test"
-                                  build:
-                                      runs-on: ubuntu-latest
-                                          steps:
-                                                - run: echo "build"
+                - name: Lint
+                        run: echo "lint"
+                          test:
+                              needs: lint
+                                  runs-on: ubuntu-latest
+                                      steps:
+                                            - name: Test
+                                                    run: echo "test"
+                                                      build:
+                                                          needs: test
+                                                              runs-on: ubuntu-latest
+                                                                  steps:
+                                                                        - name: Build
+                                                                                run: echo "build"
