@@ -8,42 +8,67 @@ on:
 
 jobs:
   lint:
+    name: Lint (flake8)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install flake8
-      - name: Lint with flake8
+          pip install -r requirements.txt
+
+      - name: Lint — errors only (fail build)
         run: |
-          # stop the build if there are Python syntax errors or undefined names
           flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
 
+      - name: Lint — style warnings (informational)
+        run: |
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=88 --statistics
+
   test:
+    name: Test (pytest)
     needs: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
       - name: Run tests
         run: |
-          echo "Running placeholder tests..."
-          # pytest
+          pytest tests/ -v --tb=short
 
   build:
+    name: Build Docker image
     needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+
       - name: Build Docker image
         run: |
-          echo "Building docker image..."
-          # docker build -t imm-os-backend .
+          docker build -t imm-os-backend:${{ github.sha }} .
+          docker tag imm-os-backend:${{ github.sha }} imm-os-backend:latest
+
+      - name: Smoke test container
+        run: |
+          docker run -d --name imm-backend-smoke -p 8000:8000 imm-os-backend:latest
+          sleep 4
+          curl -f http://localhost:8000/health
+          docker stop imm-backend-smoke
+          docker rm imm-backend-smoke
