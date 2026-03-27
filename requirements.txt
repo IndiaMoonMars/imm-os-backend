@@ -2,6 +2,10 @@
 fastapi==0.110.0
 uvicorn[standard]==0.29.0
 
+# ── Telemetry pipeline ───────────────────────────────────────────
+paho-mqtt==1.6.1
+influxdb-client==1.41.0
+
 # ── Testing ──────────────────────────────────────────────────────
 httpx==0.27.0
 pytest==8.1.1
