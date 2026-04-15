@@ -4,6 +4,7 @@ India Moon Mars Operating System · FastAPI microservice entrypoint
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from services.telemetry_api import router as telemetry_router
 
 app = FastAPI(
     title="IMM-OS Backend",
@@ -20,6 +21,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(telemetry_router)
 
 
 @app.get("/health", tags=["System"])

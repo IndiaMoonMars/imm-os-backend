@@ -72,3 +72,31 @@ jobs:
           curl -f http://localhost:8000/health
           docker stop imm-backend-smoke
           docker rm imm-backend-smoke
+
+  publish:
+    name: Publish to GHCR
+    needs: build
+    runs-on: ubuntu-latest
+    # Only publish on pushes to main (not PRs)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/indiamoonmars/imm-os-backend:latest
+            ghcr.io/indiamoonmars/imm-os-backend:${{ github.sha }}
