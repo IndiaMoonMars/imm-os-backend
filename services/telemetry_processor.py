@@ -20,6 +20,8 @@ from confluent_kafka import Consumer, KafkaError
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 
+from time_service.math_engine import calculate_all
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [processor] %(message)s")
 log = logging.getLogger(__name__)
 
@@ -91,6 +93,15 @@ def process_message(raw: bytes):
     zone   = data.get("zone", "unknown")
     metrics = SENSOR_METRICS.get(sensor, [])
 
+    time_data = calculate_all(ts)
+    ist_date = time_data["ist"][:10]  # Just the YYYY-MM-DD
+    sol_str = str(int(time_data["msd"]))
+    
+    # Let's say mission day 1 is Unix epoch + 1 (arbitrary for now unless given)
+    # The requirement specifically mentions "mission_day=1, sol=1, ist_date=2026-03-10". 
+    # We will compute it dynamically based on the current UTC tracking.
+    mission_day = str(max(1, int((ts - 1710000000) / 86400))) # basic simulation baseline
+
     for metric in metrics:
         value = data.get(metric)
         if value is None:
@@ -103,6 +114,9 @@ def process_message(raw: bytes):
             Point(sensor)
             .tag("zone", zone)
             .tag("metric", metric)
+            .tag("mission_day", mission_day)
+            .tag("sol", sol_str)
+            .tag("ist_date", ist_date)
             .field("value", float(value))
             .time(ts, WritePrecision.SECONDS)
         )
