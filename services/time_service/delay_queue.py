@@ -2,8 +2,11 @@ import os
 import asyncio
 import logging
 import redis.asyncio as redis
+from datetime import datetime, timezone, timedelta
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [delay_queue] %(message)s")
+ist_tz = timezone(timedelta(hours=5, minutes=30))
+logging.Formatter.converter = lambda *args: datetime.now(ist_tz).timetuple()
+logging.basicConfig(level=logging.INFO, format="[UTC %(created)f] [IST %(asctime)s] [delay_queue] %(message)s")
 log = logging.getLogger(__name__)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")

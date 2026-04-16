@@ -1,11 +1,18 @@
 import time
 import asyncio
+import logging
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from math_engine import calculate_all, convert_tz
 import delay_queue
+
+ist_tz = timezone(timedelta(hours=5, minutes=30))
+logging.Formatter.converter = lambda *args: datetime.now(ist_tz).timetuple()
+logging.basicConfig(level=logging.INFO, format="[UTC %(created)f] [IST %(asctime)s] [time_api] %(message)s")
+log = logging.getLogger(__name__)
 
 app = FastAPI(title="IMM-OS Time Service", version="1.0.0")
 

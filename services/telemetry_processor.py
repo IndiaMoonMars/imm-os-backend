@@ -17,12 +17,16 @@ from collections import defaultdict, deque
 import statistics
 
 from confluent_kafka import Consumer, KafkaError
+from datetime import datetime, timezone, timedelta
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 
 from time_service.math_engine import calculate_all
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [processor] %(message)s")
+# Enforce IST globally across logging outputs
+ist_tz = timezone(timedelta(hours=5, minutes=30))
+logging.Formatter.converter = lambda *args: datetime.now(ist_tz).timetuple()
+logging.basicConfig(level=logging.INFO, format="[UTC %(asctime)s] [IST %(message)s")
 log = logging.getLogger(__name__)
 
 # ── Config ──────────────────────────────────────────────────────────
