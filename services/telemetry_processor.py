@@ -15,6 +15,8 @@ import signal
 import sys
 from collections import defaultdict, deque
 import statistics
+import asyncio
+import asyncpg
 
 from confluent_kafka import Consumer, KafkaError
 from datetime import datetime, timezone, timedelta
@@ -128,9 +130,9 @@ def process_message(raw: bytes):
         # Write to normal bucket
         write_api.write(bucket=INFLUX_BUCKET, record=point)
 
-        # Anomaly detection
+        # Anomaly detection (Z-score + Physical Threshold Logging)
         if z is not None and abs(z) > ZSCORE_THRESHOLD:
-            log.warning("ANOMALY %s.%s value=%.3f z=%.2f", sensor, metric, value, z)
+            log.warning("ANOMALY Z-SCORE %s.%s value=%.3f z=%.2f", sensor, metric, value, z)
             alert_point = (
                 Point("anomaly")
                 .tag("sensor", sensor)
@@ -141,6 +143,42 @@ def process_message(raw: bytes):
                 .time(ts, WritePrecision.SECONDS)
             )
             write_api.write(bucket=INFLUX_ALERTS_BUCKET, record=alert_point)
+            
+        # Hard Physical Thresholds Logic
+        hard_limit_breached = False
+        if sensor == "scd40" and metric == "co2_ppm" and value > 1000.0:
+            hard_limit_breached = True
+        elif sensor == "bme280" and metric == "temp" and (value < 10.0 or value > 35.0):
+             hard_limit_breached = True
+        elif sensor == "ina219" and metric == "current_ma" and value > 3000.0:
+            hard_limit_breached = True
+            
+        if hard_limit_breached:
+            log.warning(f"PHYSICAL ALARM BREACHED! {sensor} {metric} -> {value}")
+            _z = z if z is not None else 0.0
+            
+            # Fire and forget async commit to standard PG tracking table
+            async def commit_pg_alert():
+                try:
+                    conn = await asyncpg.connect(
+                        user=os.getenv("POSTGRES_USER", "admin"),
+                        password=os.getenv("POSTGRES_PASSWORD", "changeme"),
+                        database=os.getenv("POSTGRES_DB", "imm_db"),
+                        host=os.getenv("POSTGRES_HOST", "postgres")
+                    )
+                    await conn.execute("""
+                        INSERT INTO alert_history (sensor_id, metric, metric_value, zscore, alert_timestamp) 
+                        VALUES ($1, $2, $3, $4, to_timestamp($5))
+                    """, sensor, metric, float(value), _z, ts)
+                    await conn.close()
+                except Exception as e:
+                    log.error(f"Postgres Alarm Commit failed: {e}")
+                    
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(commit_pg_alert())
+            except RuntimeError: # No loop, create blocking push
+                asyncio.run(commit_pg_alert())
 
     log.debug("Processed %s ts=%d", sensor, ts)
 
