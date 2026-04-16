@@ -25,8 +25,10 @@ log = logging.getLogger(__name__)
 MQTT_HOST   = os.getenv("MQTT_HOST", "localhost")
 MQTT_PORT   = int(os.getenv("MQTT_PORT", "1883"))
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
-RAW_TOPIC   = "telemetry.raw"
+RAW_TOPIC      = "telemetry.raw"
+EVA_RAW_TOPIC  = "eva.raw"
 MQTT_SUBSCRIBE = "habitat/sensors/#"
+MQTT_EVA_SUB   = "habitat/eva/#"
 
 # ── Kafka Producer ─────────────────────────────────────────────────
 producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP,
@@ -37,39 +39,42 @@ def delivery_report(err, msg):
     if err:
         log.error("Kafka delivery failed: %s", err)
 
-def ensure_topic():
+def ensure_topics():
     admin = AdminClient({"bootstrap.servers": KAFKA_BOOTSTRAP})
     existing = admin.list_topics(timeout=10).topics
-    if RAW_TOPIC not in existing:
-        admin.create_topics([NewTopic(RAW_TOPIC, num_partitions=3, replication_factor=1)])
-        log.info("Created Kafka topic: %s", RAW_TOPIC)
+    for topic in (RAW_TOPIC, EVA_RAW_TOPIC):
+        if topic not in existing:
+            admin.create_topics([NewTopic(topic, num_partitions=3, replication_factor=1)])
+            log.info("Created Kafka topic: %s", topic)
 
 # ── MQTT Callbacks ─────────────────────────────────────────────────
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         log.info("Connected to MQTT broker at %s:%d", MQTT_HOST, MQTT_PORT)
         client.subscribe(MQTT_SUBSCRIBE, qos=1)
-        log.info("Subscribed to %s", MQTT_SUBSCRIBE)
+        client.subscribe(MQTT_EVA_SUB, qos=1)
+        log.info("Subscribed to %s and %s", MQTT_SUBSCRIBE, MQTT_EVA_SUB)
     else:
         log.error("MQTT connection failed, rc=%d", rc)
 
 def on_message(client, userdata, msg):
     try:
-        # Forward raw bytes to Kafka; key = MQTT topic for deduplication
+        # Route EVA streams to dedicated topic for low-latency OpenMCT tracking
+        target_topic = EVA_RAW_TOPIC if msg.topic.startswith("habitat/eva/") else RAW_TOPIC
         producer.produce(
-            RAW_TOPIC,
+            target_topic,
             key=msg.topic.encode(),
             value=msg.payload,
             callback=delivery_report,
         )
-        producer.poll(0)  # non-blocking flush trigger
-        log.debug("Forwarded %s → %s", msg.topic, RAW_TOPIC)
+        producer.poll(0)
+        log.debug("Forwarded %s → %s", msg.topic, target_topic)
     except KafkaException as e:
         log.error("Kafka produce error: %s", e)
 
 # ── Entry point ────────────────────────────────────────────────────
 def main():
-    ensure_topic()
+    ensure_topics()
 
     client = mqtt.Client(client_id="imm-mqtt-kafka-bridge", clean_session=True)
     client.on_connect = on_connect

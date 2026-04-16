@@ -144,17 +144,25 @@ def process_message(raw: bytes):
             )
             write_api.write(bucket=INFLUX_ALERTS_BUCKET, record=alert_point)
             
-        # Hard Physical Thresholds Logic
+        # Hard Physical Thresholds Logic (habitat + EVA suit)
         hard_limit_breached = False
+        breach_reason = ""
         if sensor == "scd40" and metric == "co2_ppm" and value > 1000.0:
-            hard_limit_breached = True
+            hard_limit_breached = True; breach_reason = "CO2 > 1000 ppm"
         elif sensor == "bme280" and metric == "temp" and (value < 10.0 or value > 35.0):
-             hard_limit_breached = True
+            hard_limit_breached = True; breach_reason = f"Habitat temp out of range: {value}°C"
         elif sensor == "ina219" and metric == "current_ma" and value > 3000.0:
-            hard_limit_breached = True
+            hard_limit_breached = True; breach_reason = "Power current spike"
+        # EVA Suit biosensor limits
+        elif sensor == "eva_biosensor" and metric == "hr_bpm" and value > 160.0:
+            hard_limit_breached = True; breach_reason = f"EVA HR critical: {value} BPM"
+        elif sensor == "eva_biosensor" and metric == "spo2_pct" and value < 94.0:
+            hard_limit_breached = True; breach_reason = f"EVA SpO\u2082 critical: {value}%"
+        elif sensor == "eva_biosensor" and metric == "skin_temp_c" and value > 38.5:
+            hard_limit_breached = True; breach_reason = f"EVA skin temp: {value}°C"
             
         if hard_limit_breached:
-            log.warning(f"PHYSICAL ALARM BREACHED! {sensor} {metric} -> {value}")
+            log.warning(f"PHYSICAL ALARM BREACHED [{breach_reason}] {sensor} {metric} -> {value}")
             _z = z if z is not None else 0.0
             
             # Fire and forget async commit to standard PG tracking table
