@@ -1,0 +1,2 @@
+# Psych API — no numpy needed
+-r requirements-base.txt

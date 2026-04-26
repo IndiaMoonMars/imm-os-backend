@@ -9,7 +9,8 @@ LABEL org.opencontainers.image.version="0.1.0"
 WORKDIR /app
 
 # Install dependencies first (layer cache optimisation)
-COPY requirements.txt .
+ARG REQUIREMENTS_FILE=requirements.txt
+COPY ${REQUIREMENTS_FILE} requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy source
