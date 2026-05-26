@@ -90,9 +90,12 @@ async def list_projects(status: Optional[str] = None):
     conn = await get_conn()
     try:
         q = "SELECT * FROM projects"
-        if status: q += f" WHERE status='{status}'"
+        params = []
+        if status:
+            params.append(status)
+            q += " WHERE status=$1"
         q += " ORDER BY created_at DESC"
-        return [dict(r) for r in await conn.fetch(q)]
+        return [dict(r) for r in await conn.fetch(q, *params)]
     finally: await conn.close()
 
 @app.patch("/api/v1/scheduling/projects/{pid}/status")
