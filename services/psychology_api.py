@@ -250,7 +250,9 @@ async def get_sleep(crew_id: str, days: int = 30, user: User = Depends(current_u
             crew_id, days
         )
         avg_dur = await conn.fetchval(
-            "SELECT AVG(duration_min) FROM sleep_log WHERE crew_id=$1 ORDER BY mission_day DESC LIMIT 7", crew_id
+            """SELECT AVG(duration_min) FROM (
+                   SELECT duration_min FROM sleep_log WHERE crew_id=$1
+                   ORDER BY mission_day DESC LIMIT 7) recent""", crew_id
         )
     return {
         "entries": [dict(r) for r in rows],
