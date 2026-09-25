@@ -112,6 +112,8 @@ async def startup():
     # Broker requires auth (allow_anonymous false); user/topics in imm-os-infra mosquitto/config/acl
     if os.getenv("MQTT_USERNAME"):
         mqtt_client.username_pw_set(os.getenv("MQTT_USERNAME"), os.getenv("MQTT_PASSWORD"))
+    if os.getenv("MQTT_TLS_CA"):  # broker TLS listener (8883); verifies cert + hostname
+        mqtt_client.tls_set(ca_certs=os.getenv("MQTT_TLS_CA"))
     mqtt_client.on_connect = _on_connect
     mqtt_client.reconnect_delay_set(min_delay=1, max_delay=30)
     mqtt_client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
