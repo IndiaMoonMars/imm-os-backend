@@ -50,7 +50,7 @@ def test_latest_has_all_three_nodes():
     readings = response.json()["readings"]
     assert "node-rpi-01" in readings
     assert "node-rpi-02" in readings
-    assert "node-jetson" in readings
+    assert "node-compute" in readings
 
 
 def test_node_latest_known_node():

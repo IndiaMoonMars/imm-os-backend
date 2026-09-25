@@ -166,6 +166,11 @@ def process_message(raw: bytes):
             hard_limit_breached = True; breach_reason = f"O\u2082 out of range: {value}%"
         elif sensor == "mq7" and metric == "co_ppm" and value > 35.0:
             hard_limit_breached = True; breach_reason = f"CO > 35 ppm: {value}"
+        # Edge node health (sysmon_driver.py on every node)
+        elif sensor == "sysmon" and metric == "undervolt" and value >= 1:
+            hard_limit_breached = True; breach_reason = "Edge node under-voltage (power supply too weak)"
+        elif sensor == "sysmon" and metric == "cpu_temp" and value > 80.0:
+            hard_limit_breached = True; breach_reason = f"Edge node overheating: {value}°C"
         # EVA Suit biosensor limits
         elif sensor == "eva_biosensor" and metric == "hr_bpm" and value > 160.0:
             hard_limit_breached = True; breach_reason = f"EVA HR critical: {value} BPM"

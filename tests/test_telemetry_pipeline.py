@@ -109,10 +109,10 @@ def rec(sensor, metric, value, node="node-rpi-01", simulated="false"):
 
 def test_merge_maps_sensor_metrics_to_dashboard_names():
     out = merge_pipeline_records([rec("scd40", "co2_ppm", 640), rec("o2", "o2_pct", 20.9),
-                                  rec("bms", "battery_pct", 84, node="node-jetson")])
+                                  rec("bms", "battery_pct", 84, node="node-compute")])
     assert out["node-rpi-01"]["co2"]["value"] == 640
     assert out["node-rpi-01"]["o2"]["unit"] == "percent"
-    assert out["node-jetson"]["battery_level"]["value"] == 84
+    assert out["node-compute"]["battery_level"]["value"] == 84
 
 
 def test_merge_prefers_bme280_temperature_over_scd40_in_any_order():
@@ -197,3 +197,35 @@ def test_eva_position_frames_forwarded_for_openmct():
 def test_raw_gps_and_uwb_are_fusion_inputs_not_telemetry():
     assert route(b"habitat/eva/gps", b'{"crew_id":"ev1","lat":1,"lon":2}') is None
     assert route(b"habitat/eva/uwb", b'{"crew_id":"ev1","x_m":1,"y_m":2}') is None
+
+
+# ── node health (sysmon_driver.py; Raspberry Pi 5 compute node) ────
+
+def sysmon(**kw):
+    return {"sensor": "sysmon", "cpu_temp": 51.9, "cpu_load": 14.8, "mem_pct": 35.0, "disk_pct": 22.0,
+            "fan_rpm": 2579, "supply_v": 5.1, "power_w": 6.86, "undervolt": 0, "throttled": 0,
+            "undervolt_boot": 0, "timestamp": NOW, "node_id": "node-compute", "zone": "compute", **kw}
+
+
+def test_sysmon_reading_from_a_pi5_validates():
+    out = normalise(sysmon(), "habitat/sensors/sysmon/compute")
+    assert out["power_w"] == 6.86 and out["undervolt"] == 0 and out["fan_rpm"] == 2579
+
+
+def test_sysmon_flags_must_be_0_or_1():
+    with pytest.raises(InvalidTelemetry):
+        normalise(sysmon(undervolt=5), "habitat/sensors/sysmon/compute")
+
+
+def test_sysmon_on_a_pi4_without_pmic_metrics_validates():
+    msg = {"sensor": "sysmon", "cpu_temp": 47.0, "cpu_load": 5.0, "timestamp": NOW}
+    assert normalise(msg, "habitat/sensors/sysmon/zone_a")["zone"] == "zone_a"
+
+
+def test_merge_maps_compute_node_health():
+    out = merge_pipeline_records([rec("sysmon", "power_w", 6.9, node="node-compute"),
+                                  rec("sysmon", "cpu_temp", 52.0, node="node-compute"),
+                                  rec("sysmon", "undervolt", 1, node="node-rpi-02")])
+    assert out["node-compute"]["power_draw"] == {**out["node-compute"]["power_draw"], "value": 6.9, "unit": "watts"}
+    assert out["node-compute"]["cpu_temp"]["value"] == 52.0
+    assert out["node-rpi-02"]["undervoltage"]["value"] == 1

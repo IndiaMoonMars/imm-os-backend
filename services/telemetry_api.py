@@ -41,12 +41,12 @@ router = APIRouter(prefix="/api/telemetry", tags=["Telemetry"], dependencies=[De
 KNOWN_NODES = [
     {"id": "node-rpi-01",  "type": "rpi",    "zone": "Habitat Zone A"},
     {"id": "node-rpi-02",  "type": "rpi",    "zone": "Habitat Zone B"},
-    {"id": "node-jetson",  "type": "jetson", "zone": "Compute / Power"},
+    {"id": "node-compute", "type": "compute", "zone": "Compute / Power"},   # Raspberry Pi 5
 ]
 
 MEASUREMENTS_BY_TYPE = {
     "rpi":    ["temperature", "humidity", "pressure", "co2", "o2"],
-    "jetson": ["cpu_temp", "gpu_temp", "power_draw", "battery_level", "solar_input"],
+    "compute": ["cpu_temp", "power_draw", "battery_level", "solar_input"],
 }
 
 
@@ -271,10 +271,9 @@ def _mock_latest() -> dict:
                 "co2":         {"value": round(420 + random.uniform(-5, 5), 1), "unit": "ppm", "simulated": True},
                 "o2":          {"value": round(20.8 + random.uniform(-0.05, 0.05), 2), "unit": "percent", "simulated": True},
             },
-            "node-jetson": {
-                "cpu_temp":     {"value": sw(55, 5, 1800), "unit": "celsius", "simulated": True},
-                "gpu_temp":     {"value": sw(60, 8, 1800), "unit": "celsius", "simulated": True},
-                "power_draw":   {"value": round(12 + random.uniform(-1, 1), 1), "unit": "watts", "simulated": True},
+            "node-compute": {
+                "cpu_temp":     {"value": sw(52, 4, 1800), "unit": "celsius", "simulated": True},
+                "power_draw":   {"value": round(6.5 + random.uniform(-0.4, 0.4), 1), "unit": "watts", "simulated": True},
                 "battery_level":{"value": round(85 + random.uniform(-0.5, 0.5), 1), "unit": "percent", "simulated": True},
                 "solar_input":  {"value": max(0, sw(8, 8, 86400)), "unit": "watts", "simulated": True},
             },

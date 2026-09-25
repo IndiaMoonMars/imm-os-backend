@@ -28,7 +28,8 @@ class SensorType(str, Enum):
     tsl2561 = "tsl2561"        # light
     ina219 = "ina219"          # bus voltage / current / power
     o2 = "o2"                  # electrochemical O₂ cell via ADS1115
-    jetson = "jetson"          # Jetson on-board CPU/GPU temperature and power
+    sysmon = "sysmon"          # node health on every edge node (Raspberry Pi 4/5)
+    jetson = "jetson"          # Jetson on-board CPU/GPU temperature and power (optional hardware)
     bms = "bms"                # battery management / solar input
     eva_biosensor = "eva_biosensor"  # EVA suit vitals (habitat/eva/biosensors/<crew>)
 
@@ -59,6 +60,14 @@ class TelemetryPayload(BaseModel):
     cpu_temp: Optional[float] = None
     gpu_temp: Optional[float] = None
     power_w: Optional[float] = None
+    cpu_load: Optional[float] = None
+    mem_pct: Optional[float] = None
+    disk_pct: Optional[float] = None
+    fan_rpm: Optional[float] = None
+    supply_v: Optional[float] = None
+    undervolt: Optional[int] = Field(None, ge=0, le=1)
+    throttled: Optional[int] = Field(None, ge=0, le=1)
+    undervolt_boot: Optional[int] = Field(None, ge=0, le=1)
     battery_pct: Optional[float] = None
     solar_w: Optional[float] = None
     skin_temp_c: Optional[float] = None
@@ -81,6 +90,8 @@ SENSOR_METRICS: Dict[str, List[str]] = {
     "tsl2561": ["lux"],
     "ina219": ["voltage_v", "current_ma", "power_mw"],
     "o2": ["o2_pct"],
+    "sysmon": ["cpu_temp", "cpu_load", "mem_pct", "disk_pct", "fan_rpm", "power_w", "supply_v",
+               "undervolt", "throttled", "undervolt_boot"],
     "jetson": ["cpu_temp", "gpu_temp", "power_w"],
     "bms": ["battery_pct", "solar_w"],
     "eva_biosensor": ["hr_bpm", "spo2_pct", "skin_temp_c"],
@@ -98,6 +109,15 @@ DASHBOARD_MEASUREMENTS: Dict[Tuple[str, str], Tuple[str, str]] = {
     ("o2", "o2_pct"): ("o2", "percent"),
     ("mq7", "co_ppm"): ("co", "ppm"),
     ("tsl2561", "lux"): ("light", "lux"),
+    ("sysmon", "cpu_temp"): ("cpu_temp", "celsius"),
+    ("sysmon", "power_w"): ("power_draw", "watts"),
+    ("sysmon", "cpu_load"): ("cpu_load", "percent"),
+    ("sysmon", "mem_pct"): ("memory", "percent"),
+    ("sysmon", "disk_pct"): ("disk", "percent"),
+    ("sysmon", "fan_rpm"): ("fan", "rpm"),
+    ("sysmon", "supply_v"): ("supply_voltage", "volts"),
+    ("sysmon", "undervolt"): ("undervoltage", "flag"),
+    ("sysmon", "throttled"): ("throttled", "flag"),
     ("jetson", "cpu_temp"): ("cpu_temp", "celsius"),
     ("jetson", "gpu_temp"): ("gpu_temp", "celsius"),
     ("jetson", "power_w"): ("power_draw", "watts"),
@@ -105,7 +125,7 @@ DASHBOARD_MEASUREMENTS: Dict[Tuple[str, str], Tuple[str, str]] = {
     ("bms", "solar_w"): ("solar_input", "watts"),
 }
 
-SENSOR_PRIORITY = ["bme280", "o2", "scd40", "mq7", "tsl2561", "jetson", "bms"]
+SENSOR_PRIORITY = ["bme280", "o2", "scd40", "mq7", "tsl2561", "sysmon", "jetson", "bms"]
 
 
 class InvalidTelemetry(ValueError):
