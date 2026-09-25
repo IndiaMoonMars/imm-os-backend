@@ -65,16 +65,20 @@ def zscore(key: tuple, value: float) -> float | None:
         return 0.0
     return (value - mean) / stdev
 
-# ── Metric fields per sensor ────────────────────────────────────────
-SENSOR_METRICS = {
-    "bme280":     ["temp", "hum", "pres"],
-    "scd40":      ["co2_ppm", "temp", "hum"],
-    "mq7":        ["co_ppm"],
-    "max30100":   ["hr_bpm", "spo2_pct"],
-    "ecg_ad8232": ["voltage"],
-    "tsl2561":    ["lux"],
-    "ina219":     ["voltage_v", "current_ma", "power_mw"],
-}
+# ── Metric fields per sensor (shared with the validator) ────────────
+from telemetry_schema import SENSOR_METRICS  # noqa: E402  (script runs from services/)
+
+
+def ensure_buckets():
+    """Create the sensor and alert buckets if missing (fresh or pre-existing InfluxDB volume)."""
+    api = influx.buckets_api()
+    org_id = next((o.id for o in influx.organizations_api().find_organizations(org=INFLUX_ORG)), None)
+    for name, days in ((INFLUX_BUCKET, 90), (INFLUX_ALERTS_BUCKET, 30)):
+        if api.find_bucket_by_name(name) is None:
+            from influxdb_client import BucketRetentionRules
+            api.create_bucket(bucket_name=name, org_id=org_id,
+                              retention_rules=BucketRetentionRules(type="expire", every_seconds=days * 86400))
+            log.info("Created InfluxDB bucket %s (%d-day retention)", name, days)
 
 # ── Processor ───────────────────────────────────────────────────────
 def normalise_timestamp(ts: int | float) -> int:
@@ -97,6 +101,8 @@ def process_message(raw: bytes):
     sensor = data.get("sensor")
     ts     = normalise_timestamp(data.get("timestamp", time.time()))
     zone   = data.get("zone", "unknown")
+    node_id = str(data.get("node_id") or "unknown")
+    simulated = "true" if data.get("simulated") else "false"
     metrics = SENSOR_METRICS.get(sensor, [])
 
     time_data = calculate_all(ts)
@@ -119,6 +125,8 @@ def process_message(raw: bytes):
         point = (
             Point(sensor)
             .tag("zone", zone)
+            .tag("node_id", node_id)
+            .tag("simulated", simulated)
             .tag("metric", metric)
             .tag("mission_day", mission_day)
             .tag("sol", sol_str)
@@ -153,6 +161,10 @@ def process_message(raw: bytes):
             hard_limit_breached = True; breach_reason = f"Habitat temp out of range: {value}°C"
         elif sensor == "ina219" and metric == "current_ma" and value > 3000.0:
             hard_limit_breached = True; breach_reason = "Power current spike"
+        elif sensor == "o2" and metric == "o2_pct" and (value < 19.5 or value > 23.5):
+            hard_limit_breached = True; breach_reason = f"O\u2082 out of range: {value}%"
+        elif sensor == "mq7" and metric == "co_ppm" and value > 35.0:
+            hard_limit_breached = True; breach_reason = f"CO > 35 ppm: {value}"
         # EVA Suit biosensor limits
         elif sensor == "eva_biosensor" and metric == "hr_bpm" and value > 160.0:
             hard_limit_breached = True; breach_reason = f"EVA HR critical: {value} BPM"
@@ -192,6 +204,13 @@ def process_message(raw: bytes):
 
 # ── Main ────────────────────────────────────────────────────────────
 def main():
+    for attempt in range(10):
+        try:
+            ensure_buckets()
+            break
+        except Exception as exc:  # InfluxDB still starting
+            log.warning("InfluxDB bucket check failed (%s); retrying", exc)
+            time.sleep(3)
     consumer = Consumer({
         "bootstrap.servers": KAFKA_BOOTSTRAP,
         "group.id": KAFKA_GROUP_ID,

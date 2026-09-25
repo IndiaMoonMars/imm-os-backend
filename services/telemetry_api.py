@@ -2,8 +2,14 @@
 IMM-OS Backend — Telemetry API Router
 Provides REST endpoints that query InfluxDB for live + historical sensor data.
 
-Topics produced by the sensor simulator / real sensors:
-  imm/habitat/{node_id}/telemetry/{measurement}
+Readings come from the telemetry pipeline (edge drivers and the simulator publish on
+habitat/sensors/<sensor>/<zone> → Kafka → validator → processor → InfluxDB
+"habitat_sensors"). Sensor metrics are mapped to dashboard measurement names
+(bme280.temp → temperature, …) by services/telemetry_schema.py.
+
+The older per-node topic format (imm/habitat/{node_id}/telemetry/{measurement},
+written by telemetry_worker into the "telemetry" bucket) is still read as a
+fallback, so nodes using the real-sensors/ templates keep showing up.
 
 These routes are mounted at /api so nginx proxies /api/ → this service.
 """
@@ -17,6 +23,7 @@ from influxdb_client import InfluxDBClient
 from influxdb_client.client.exceptions import InfluxDBError
 
 from services.auth import current_user
+from services.telemetry_schema import DASHBOARD_MEASUREMENTS, SENSOR_PRIORITY
 
 log = logging.getLogger("telemetry_api")
 
@@ -25,7 +32,8 @@ log = logging.getLogger("telemetry_api")
 INFLUX_URL    = os.getenv("INFLUX_URL",    "http://localhost:8086")
 INFLUX_TOKEN  = os.getenv("INFLUX_TOKEN",  "imm-super-secret-token")
 INFLUX_ORG    = os.getenv("INFLUX_ORG",    "imm_org")
-INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "telemetry")
+INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "telemetry")                      # legacy per-node bucket
+PIPELINE_BUCKET = os.getenv("INFLUX_PIPELINE_BUCKET", "habitat_sensors")   # telemetry-processor output
 
 router = APIRouter(prefix="/api/telemetry", tags=["Telemetry"], dependencies=[Depends(current_user)])
 
@@ -99,35 +107,79 @@ async def get_node_history(
     if not node:
         raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
 
+    if measurement not in KNOWN_MEASUREMENTS:
+        raise HTTPException(status_code=422, detail=f"Unknown measurement '{measurement}'")
     try:
-        query = f"""
-        from(bucket: "{INFLUX_BUCKET}")
-          |> range(start: -24h)
-          |> filter(fn: (r) => r["node_id"] == "{node_id}")
-          |> filter(fn: (r) => r["_measurement"] == "{measurement}")
-          |> sort(columns: ["_time"], desc: true)
-          |> limit(n: {limit})
-        """
         with _get_client() as client:
-            tables = client.query_api().query(query)
-            results = []
-            for table in tables:
-                for record in table.records:
-                    results.append({
-                        "timestamp": record.get_time().isoformat(),
-                        "value": record.get_value(),
-                        "unit": record.values.get("unit", ""),
-                        "simulated": record.values.get("simulated", True),
-                    })
-            return {"node_id": node_id, "measurement": measurement, "data": results}
+            results = _history_from_pipeline(client, node_id, measurement, limit) \
+                or _history_from_legacy(client, node_id, measurement, limit)
+        return {"node_id": node_id, "measurement": measurement, "data": results}
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"InfluxDB unavailable: {exc}")
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _query_latest_from_influx(node_id: Optional[str] = None) -> dict:
-    """Query InfluxDB for the latest reading per field per node."""
+KNOWN_MEASUREMENTS = {m for m, _ in DASHBOARD_MEASUREMENTS.values()} | {
+    m for ms in MEASUREMENTS_BY_TYPE.values() for m in ms}
+
+
+def _as_bool(v) -> bool:
+    return v is True or str(v).lower() == "true"
+
+
+def merge_pipeline_records(records: list) -> dict:
+    """
+    Turn latest pipeline points into {node_id: {measurement: reading}}.
+
+    Each record is a dict with the point's tags (``_measurement`` = sensor, ``metric``,
+    ``node_id``, ``simulated``) plus ``value`` and ``timestamp``. When several sensors on
+    a node report the same measurement, SENSOR_PRIORITY decides which one is shown.
+    """
+    out: dict = {}
+    rank: dict = {}
+    for r in records:
+        mapped = DASHBOARD_MEASUREMENTS.get((r.get("_measurement"), r.get("metric")))
+        if not mapped:
+            continue
+        name, unit = mapped
+        node = r.get("node_id") or "unknown"
+        sensor = r["_measurement"]
+        pr = SENSOR_PRIORITY.index(sensor) if sensor in SENSOR_PRIORITY else len(SENSOR_PRIORITY)
+        if (node, name) in rank and rank[(node, name)] <= pr:
+            continue
+        rank[(node, name)] = pr
+        out.setdefault(node, {})[name] = {
+            "value": r["value"], "unit": unit, "timestamp": r.get("timestamp"),
+            "simulated": _as_bool(r.get("simulated")), "sensor": sensor, "zone": r.get("zone"),
+        }
+    return out
+
+
+def _records(tables) -> list:
+    rows = []
+    for table in tables:
+        for record in table.records:
+            row = {k: v for k, v in record.values.items() if not k.startswith("_") or k == "_measurement"}
+            row["value"] = record.get_value()
+            row["timestamp"] = record.get_time().isoformat()
+            rows.append(row)
+    return rows
+
+
+def _latest_from_pipeline(client, node_id: Optional[str] = None) -> dict:
+    node_filter = f'|> filter(fn: (r) => r["node_id"] == "{node_id}")' if node_id else ""
+    query = f"""
+    from(bucket: "{PIPELINE_BUCKET}")
+      |> range(start: -5m)
+      |> filter(fn: (r) => r["_field"] == "value")
+      {node_filter}
+      |> last()
+    """
+    return merge_pipeline_records(_records(client.query_api().query(query)))
+
+
+def _latest_from_legacy(client, node_id: Optional[str] = None) -> dict:
     node_filter = f'|> filter(fn: (r) => r["node_id"] == "{node_id}")' if node_id else ""
     query = f"""
     from(bucket: "{INFLUX_BUCKET}")
@@ -137,19 +189,65 @@ def _query_latest_from_influx(node_id: Optional[str] = None) -> dict:
       |> group(columns: ["node_id", "_measurement"])
     """
     readings: dict = {}
+    for table in client.query_api().query(query):
+        for record in table.records:
+            nid = record.values.get("node_id", "unknown")
+            readings.setdefault(nid, {})[record.get_measurement()] = {
+                "value": record.get_value(),
+                "unit": record.values.get("unit", ""),
+                "timestamp": record.get_time().isoformat(),
+                "simulated": _as_bool(record.values.get("simulated", True)),
+            }
+    return readings
+
+
+def _query_latest_from_influx(node_id: Optional[str] = None) -> dict:
+    """Latest reading per measurement per node; pipeline data wins over legacy data."""
     with _get_client() as client:
-        tables = client.query_api().query(query)
-        for table in tables:
-            for record in table.records:
-                nid = record.values.get("node_id", "unknown")
-                meas = record.get_measurement()
-                readings.setdefault(nid, {})[meas] = {
-                    "value": record.get_value(),
-                    "unit": record.values.get("unit", ""),
-                    "timestamp": record.get_time().isoformat(),
-                    "simulated": record.values.get("simulated", True),
-                }
+        readings = {}
+        for source in (_latest_from_legacy, _latest_from_pipeline):
+            try:
+                for nid, ms in source(client, node_id).items():
+                    readings.setdefault(nid, {}).update(ms)
+            except Exception as exc:
+                if source is _latest_from_pipeline and not readings:
+                    raise
+                log.debug("%s unavailable: %s", source.__name__, exc)
     return {"readings": readings}
+
+
+def _history_from_pipeline(client, node_id: str, measurement: str, limit: int) -> list:
+    candidates = sorted((k for k, v in DASHBOARD_MEASUREMENTS.items() if v[0] == measurement),
+                        key=lambda k: SENSOR_PRIORITY.index(k[0]) if k[0] in SENSOR_PRIORITY else 99)
+    for sensor, metric in candidates:
+        unit = DASHBOARD_MEASUREMENTS[(sensor, metric)][1]
+        query = f"""
+        from(bucket: "{PIPELINE_BUCKET}")
+          |> range(start: -24h)
+          |> filter(fn: (r) => r["_measurement"] == "{sensor}" and r["metric"] == "{metric}")
+          |> filter(fn: (r) => r["node_id"] == "{node_id}" and r["_field"] == "value")
+          |> sort(columns: ["_time"], desc: true)
+          |> limit(n: {limit})
+        """
+        rows = _records(client.query_api().query(query))
+        if rows:
+            return [{"timestamp": r["timestamp"], "value": r["value"], "unit": unit,
+                     "simulated": _as_bool(r.get("simulated"))} for r in rows]
+    return []
+
+
+def _history_from_legacy(client, node_id: str, measurement: str, limit: int) -> list:
+    query = f"""
+    from(bucket: "{INFLUX_BUCKET}")
+      |> range(start: -24h)
+      |> filter(fn: (r) => r["node_id"] == "{node_id}")
+      |> filter(fn: (r) => r["_measurement"] == "{measurement}")
+      |> sort(columns: ["_time"], desc: true)
+      |> limit(n: {limit})
+    """
+    return [{"timestamp": r["timestamp"], "value": r["value"], "unit": r.get("unit", ""),
+             "simulated": _as_bool(r.get("simulated", True))}
+            for r in _records(client.query_api().query(query))]
 
 
 def _mock_latest() -> dict:

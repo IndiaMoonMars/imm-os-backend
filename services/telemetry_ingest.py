@@ -8,22 +8,23 @@ IMM-OS Telemetry API Server
 """
 
 import os
+import re
 import json
 import logging
 import asyncio
 import threading
 from typing import Optional, List
-from enum import Enum
 from datetime import datetime, timezone, timedelta
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel
 from confluent_kafka import Producer, Consumer, KafkaException, KafkaError
 from influxdb_client import InfluxDBClient
 import asyncpg
 
 from services.auth import IMM_ROLES, User, current_user, edge_device, user_from_token
+from services.telemetry_schema import SENSOR_METRICS, InvalidTelemetry, normalise
 
 ist_tz = timezone(timedelta(hours=5, minutes=30))
 logging.Formatter.converter = lambda *args: datetime.now(ist_tz).timetuple()
@@ -42,43 +43,7 @@ producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP, "acks": "all"})
 app = FastAPI(title="IMM-OS Telemetry Server", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_headers=["*"], allow_methods=["*"])
 
-# ── Pydantic sensor schemas ────────────────────────────────────────
-
-class SensorType(str, Enum):
-    bme280   = "bme280"
-    scd40    = "scd40"
-    mq7      = "mq7"
-    max30100 = "max30100"
-    ecg_ad8232 = "ecg_ad8232"
-    tsl2561  = "tsl2561"
-    ina219   = "ina219"
-
-class TelemetryPayload(BaseModel):
-    sensor:    SensorType
-    timestamp: int = Field(..., gt=0)
-    sig:       Optional[str] = None
-    # Data fields
-    temp:      Optional[float] = None
-    hum:       Optional[float] = None
-    pres:      Optional[float] = None
-    co2_ppm:   Optional[float] = None
-    co_ppm:    Optional[float] = None
-    hr_bpm:    Optional[float] = None
-    spo2_pct:  Optional[float] = None
-    voltage:   Optional[float] = None
-    lux:       Optional[float] = None
-    zone:      Optional[str]   = None
-    voltage_v: Optional[float] = None
-    current_ma:Optional[float] = None
-    power_mw:  Optional[float] = None
-
-    @validator("timestamp")
-    def timestamp_reasonable(cls, v):
-        import time
-        now = int(time.time())
-        if abs(v - now) > 86400 * 7:
-            raise ValueError("Timestamp too far from current time")
-        return v
+# ── Sensor schema: shared with the validator (services/telemetry_schema.py) ──
 
 class CommandReq(BaseModel):
     command_text: str
@@ -143,18 +108,17 @@ async def ingest(request: Request):
     except Exception:
         raise HTTPException(status_code=422, detail="Invalid JSON body")
 
-    payload_data = body.get("data", body)
     try:
-        payload = TelemetryPayload(**payload_data)
-    except Exception as e:
+        reading = normalise(body)
+    except InvalidTelemetry as e:
         raise HTTPException(status_code=422, detail=str(e))
-        
-    envelope = {"data": payload.dict(), "sig": body.get("sig")}
+
+    envelope = {"data": reading, "sig": reading.pop("sig", None)}
 
     try:
         producer.produce(
             VALIDATED_TOPIC,
-            key=payload.sensor.encode(),
+            key=reading["sensor"].encode(),
             value=json.dumps(envelope).encode(),
         )
         producer.poll(0)
@@ -162,10 +126,16 @@ async def ingest(request: Request):
         log.error("Kafka produce error: %s", e)
         raise HTTPException(status_code=503, detail="Kafka unavailable")
 
-    return {"accepted": True, "sensor": payload.sensor}
+    return {"accepted": True, "sensor": reading["sensor"]}
 
 @app.get("/history", dependencies=[Depends(current_user)])
 def get_history(start: int, end: int, sensor: str, metric: str, zone: str = None):
+    """History for one sensor metric; start/end are Unix seconds."""
+    # values go into the Flux query text, so only accept known names
+    if metric not in SENSOR_METRICS.get(sensor, []):
+        raise HTTPException(status_code=422, detail=f"Unknown sensor metric {sensor}.{metric}")
+    if zone is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", zone):
+        raise HTTPException(status_code=422, detail="Invalid zone")
     client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
     query_api = client.query_api()
 
