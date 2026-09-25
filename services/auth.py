@@ -1,19 +1,23 @@
 """
 Shared authentication for IMM-OS FastAPI services.
 
-Two kinds of caller are accepted:
+Callers:
   - Crew / MCC users: `Authorization: Bearer <Keycloak access token>` from the
-    IndiaMoonMars realm. Signature (RS256, realm JWKS), issuer, audience and
-    expiry are verified; identity comes from `preferred_username` and roles
-    from `realm_access.roles`.
+    IndiaMoonMars realm (browser login). Signature (RS256, realm JWKS), issuer,
+    audience and expiry are verified; identity comes from `preferred_username`
+    and roles from `realm_access.roles`.
+  - Edge devices (RPi / Jetson): Bearer token from the `imm-edge`
+    client-credentials client, carrying the `edge_device` role.
   - Internal services (docker network only): `X-IMM-Service-Token` matching
-    IMM_SERVICE_TOKEN. Interim until each service gets its own Keycloak
-    client-credentials client.
+    IMM_SERVICE_TOKEN.
+  - Third-party webhooks that can't use Keycloak: a shared secret
+    (require_shared_secret).
 
 Usage:
-    from services.auth import User, current_user, require_roles, ensure_self_or_roles
-    @app.get("/x", dependencies=[Depends(current_user)])           # any logged-in user
-    async def y(user: User = Depends(require_roles("flight_surgeon"))): ...
+    from services.auth import User, current_user, edge_device, require_roles, ensure_self_or_roles
+    @app.get("/x", dependencies=[Depends(current_user)])           # any crew/MCC user
+    @app.post("/y", dependencies=[Depends(edge_device)])           # edge devices
+    async def z(user: User = Depends(require_roles("flight_surgeon"))): ...
     ensure_self_or_roles(user, crew_id, "flight_surgeon")          # own data or privileged
 """
 import hmac
@@ -22,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import FrozenSet, Optional
 
 import jwt
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header, HTTPException, Query
 
 KEYCLOAK_ISSUER = os.getenv(
     "KEYCLOAK_ISSUER", "http://imm.local/auth/realms/IndiaMoonMars")
@@ -37,6 +41,7 @@ CREW = "crew"
 COMMANDER = "commander"
 FLIGHT_SURGEON = "flight_surgeon"
 MCC_OPERATOR = "mcc_operator"
+EDGE_DEVICE = "edge_device"  # imm-edge client-credentials service account
 SERVICE = "service"  # internal service-to-service calls only
 IMM_ROLES = frozenset({CREW, COMMANDER, FLIGHT_SURGEON, MCC_OPERATOR})
 
@@ -82,10 +87,26 @@ def decode_token(token: str) -> dict:
     )
 
 
-def current_user(
+def user_from_token(token: str) -> User:
+    """Verify a Keycloak access token and return its user (no role check)."""
+    try:
+        claims = decode_token(token)
+    except jwt.PyJWKClientError:
+        raise HTTPException(503, "Identity provider unavailable")
+    except jwt.PyJWTError:
+        raise HTTPException(401, "Invalid or expired token",
+                            headers={"WWW-Authenticate": "Bearer"})
+    username = claims.get("preferred_username")
+    if not username:
+        raise HTTPException(401, "Token has no username")
+    return User(username=username, roles=frozenset(claims.get("realm_access", {}).get("roles", [])))
+
+
+def authenticated(
     authorization: Optional[str] = Header(None),
     x_imm_service_token: Optional[str] = Header(None),
 ) -> User:
+    """Any verified caller: service token or a valid realm token (roles not checked)."""
     expected = os.getenv("IMM_SERVICE_TOKEN", "")
     if x_imm_service_token is not None:
         if expected and hmac.compare_digest(x_imm_service_token, expected):
@@ -95,22 +116,43 @@ def current_user(
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "Missing bearer token",
                             headers={"WWW-Authenticate": "Bearer"})
-    try:
-        claims = decode_token(authorization[7:].strip())
-    except jwt.PyJWKClientError:
-        raise HTTPException(503, "Identity provider unavailable")
-    except jwt.PyJWTError:
-        raise HTTPException(401, "Invalid or expired token",
-                            headers={"WWW-Authenticate": "Bearer"})
+    return user_from_token(authorization[7:].strip())
 
-    username = claims.get("preferred_username")
-    if not username:
-        raise HTTPException(401, "Token has no username")
-    roles = frozenset(claims.get("realm_access", {}).get("roles", []))
-    # Realm accounts carry Keycloak default roles; require an explicit IMM-OS role
-    if not roles & IMM_ROLES:
+
+def current_user(user: User = Depends(authenticated)) -> User:
+    """Crew / MCC user (or internal service)."""
+    # Realm accounts carry Keycloak default roles, and edge devices carry only
+    # edge_device; require an explicit crew/MCC role for human-facing APIs
+    if not (user.is_service or user.roles & IMM_ROLES):
         raise HTTPException(403, "No IMM-OS role assigned to this account")
-    return User(username=username, roles=roles)
+    return user
+
+
+def edge_device(user: User = Depends(authenticated)) -> User:
+    """Edge device (imm-edge service account) or internal service."""
+    if not (user.is_service or EDGE_DEVICE in user.roles):
+        raise HTTPException(403, "Edge device credentials required")
+    return user
+
+
+def require_shared_secret(env_var: str, header: str = "X-IMM-Webhook-Token"):
+    """
+    Dependency for third-party webhooks that can't obtain Keycloak tokens.
+    The secret may be sent in `header` or a `token` query parameter (for
+    providers that only let you configure a URL). Disabled (503) when the
+    env var is unset, so an unconfigured webhook is never open.
+    """
+    def checker(
+        header_token: Optional[str] = Header(None, alias=header),
+        token: Optional[str] = Query(None),
+    ) -> None:
+        expected = os.getenv(env_var, "")
+        if not expected:
+            raise HTTPException(503, "Webhook not configured")
+        provided = header_token or token or ""
+        if not hmac.compare_digest(provided, expected):
+            raise HTTPException(401, "Invalid webhook token")
+    return checker
 
 
 def require_roles(*roles: str):

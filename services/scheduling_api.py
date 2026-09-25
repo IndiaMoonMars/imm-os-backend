@@ -55,7 +55,7 @@ async def get_conn(): return await asyncpg.connect(**PG)
 async def current_mission_day() -> int:
     try:
         async with httpx.AsyncClient(timeout=2) as c:
-            r = await c.get(f"{TIME_SVC}/api/v1/time/now")
+            r = await c.get(f"{TIME_SVC}/api/v1/time/now", headers=service_headers())
             ts = float(r.json().get("unix_ts", time.time()))
             return max(1, int((ts - 1710000000) / 86400))
     except Exception:

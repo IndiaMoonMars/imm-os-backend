@@ -16,12 +16,14 @@ from typing import Optional, List
 from enum import Enum
 from datetime import datetime, timezone, timedelta
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from confluent_kafka import Producer, Consumer, KafkaException, KafkaError
 from influxdb_client import InfluxDBClient
 import asyncpg
+
+from services.auth import IMM_ROLES, User, current_user, edge_device, user_from_token
 
 ist_tz = timezone(timedelta(hours=5, minutes=30))
 logging.Formatter.converter = lambda *args: datetime.now(ist_tz).timetuple()
@@ -79,8 +81,8 @@ class TelemetryPayload(BaseModel):
         return v
 
 class CommandReq(BaseModel):
-    operator_id: str
     command_text: str
+    operator_id: Optional[str] = None  # ignored; the operator is the logged-in user
 
 # ── Live Broadcast WebSockets ──────────────────────────────────────
 
@@ -88,8 +90,7 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
+    def register(self, websocket: WebSocket):
         self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket):
@@ -135,7 +136,7 @@ async def startup_event():
 def health():
     return {"status": "ok"}
 
-@app.post("/ingest", status_code=202)
+@app.post("/ingest", status_code=202, dependencies=[Depends(edge_device)])
 async def ingest(request: Request):
     try:
         body = await request.json()
@@ -163,7 +164,7 @@ async def ingest(request: Request):
 
     return {"accepted": True, "sensor": payload.sensor}
 
-@app.get("/history")
+@app.get("/history", dependencies=[Depends(current_user)])
 def get_history(start: int, end: int, sensor: str, metric: str, zone: str = None):
     client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
     query_api = client.query_api()
@@ -198,7 +199,7 @@ def get_history(start: int, end: int, sensor: str, metric: str, zone: str = None
 
     return results
 
-@app.get("/alerts")
+@app.get("/alerts", dependencies=[Depends(current_user)])
 def get_alerts(since: int):
     client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
     query_api = client.query_api()
@@ -228,7 +229,7 @@ def get_alerts(since: int):
     return results
 
 @app.post("/commands", status_code=201)
-async def log_command(req: CommandReq):
+async def log_command(req: CommandReq, user: User = Depends(current_user)):
     try:
         conn = await asyncpg.connect(
             user=os.getenv("POSTGRES_USER", "admin"),
@@ -238,18 +239,46 @@ async def log_command(req: CommandReq):
         )
         await conn.execute(
             "INSERT INTO command_history (operator_id, command_text) VALUES ($1, $2)",
-            req.operator_id, req.command_text
+            user.username, req.command_text
         )
         await conn.close()
-        log.info(f"Command stored: {req.operator_id} -> {req.command_text}")
+        log.info(f"Command stored: {user.username} -> {req.command_text}")
         return {"logged": True}
     except Exception as e:
         log.error(f"Postgres insert failed: {e}")
         raise HTTPException(status_code=500, detail="Database failure")
 
+WS_AUTH_TIMEOUT_S = 5
+
+
+async def authenticate_websocket(websocket: WebSocket) -> Optional[User]:
+    """
+    Browsers can't set headers on WebSocket requests, and tokens in URLs end up
+    in proxy logs, so the client sends {"type": "auth", "token": "<jwt>"} as its
+    first message. Returns the user, or None after closing the socket (4401).
+    """
+    try:
+        msg = json.loads(await asyncio.wait_for(websocket.receive_text(), WS_AUTH_TIMEOUT_S))
+        if msg.get("type") != "auth":
+            raise ValueError("first message must be auth")
+        user = user_from_token(str(msg.get("token", "")))
+        if not user.roles & IMM_ROLES:
+            raise ValueError("no IMM-OS role")
+        return user
+    except WebSocketDisconnect:
+        return None
+    except (asyncio.TimeoutError, ValueError, HTTPException, AttributeError, TypeError):
+        await websocket.close(code=4401, reason="Unauthorized")
+        return None
+
+
 @app.websocket("/realtime")
 async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+    await websocket.accept()
+    user = await authenticate_websocket(websocket)
+    if user is None:
+        return
+    manager.register(websocket)
     try:
         while True:
             # heartbeat or client-sent filters

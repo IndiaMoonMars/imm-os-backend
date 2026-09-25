@@ -17,7 +17,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from services.auth import current_user
+from services.auth import current_user, edge_device
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [eva_api] %(message)s")
 log = logging.getLogger(__name__)
@@ -141,7 +141,7 @@ async def update_checklist(plan_id: int, update: ChecklistUpdate):
 
 # ── Tool inventory routes ─────────────────────────────────────────
 
-@app.post("/api/v1/eva/tools/register", status_code=201)
+@app.post("/api/v1/eva/tools/register", status_code=201, dependencies=[Depends(edge_device)])
 async def register_tool(tool: ToolRegister):
     conn = await get_conn()
     try:
@@ -166,7 +166,7 @@ async def list_tools():
     finally:
         await conn.close()
 
-@app.post("/api/v1/eva/tools/scan", status_code=201)
+@app.post("/api/v1/eva/tools/scan", status_code=201, dependencies=[Depends(edge_device)])
 async def scan_tool(scan: ToolScan):
     if scan.action not in ("CHECKOUT", "CHECKIN"):
         raise HTTPException(status_code=422, detail="action must be CHECKOUT or CHECKIN")

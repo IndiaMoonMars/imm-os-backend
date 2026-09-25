@@ -25,7 +25,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, conint, confloat
 
-from services.auth import current_user
+from services.auth import current_user, edge_device
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [eclss_api] %(message)s")
 log = logging.getLogger(__name__)
@@ -191,7 +191,7 @@ async def _insert(sql: str, *args):
         await conn.close()
 
 
-@app.post("/api/v1/waste/log", status_code=201)
+@app.post("/api/v1/waste/log", status_code=201, dependencies=[Depends(edge_device)])
 async def log_waste(event: WasteEvent):
     row_id = await _insert(
         "INSERT INTO waste_events (weight_kg, rfid_tag, container) VALUES ($1, $2, $3) RETURNING id",
@@ -201,7 +201,7 @@ async def log_waste(event: WasteEvent):
     return {"status": "logged", "id": row_id}
 
 
-@app.post("/api/v1/water/shower", status_code=201)
+@app.post("/api/v1/water/shower", status_code=201, dependencies=[Depends(edge_device)])
 async def log_shower(event: ShowerEvent):
     row_id = await _insert(
         "INSERT INTO shower_events (duration_seconds, estimated_liters) VALUES ($1, $2) RETURNING id",
@@ -211,7 +211,7 @@ async def log_shower(event: ShowerEvent):
     return {"status": "logged", "id": row_id}
 
 
-@app.post("/api/v1/water/log", status_code=201)
+@app.post("/api/v1/water/log", status_code=201, dependencies=[Depends(edge_device)])
 async def log_flow(event: FlowEvent):
     row_id = await _insert(
         "INSERT INTO water_flow_events (event_ml, daily_total_ml, source) VALUES ($1, $2, $3) RETURNING id",
@@ -221,7 +221,7 @@ async def log_flow(event: FlowEvent):
     return {"status": "logged", "id": row_id}
 
 
-@app.post("/api/v1/biolab/log", status_code=201)
+@app.post("/api/v1/biolab/log", status_code=201, dependencies=[Depends(edge_device)])
 async def log_biolab(event: BiolabEvent):
     row_id = await _insert(
         "INSERT INTO biolab_readings (ph_level, water_temp_c) VALUES ($1, $2) RETURNING id",

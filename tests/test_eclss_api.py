@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from services import eclss_api
-from services.auth import User, current_user
+from services.auth import User, authenticated, current_user
 
 
 class FakeTx:
@@ -95,10 +95,23 @@ def test_lighting_requires_login(db, broker):
     assert client.put("/api/v1/eclss/lighting/lab", json={"brightness": 1, "kelvin": 3000}).status_code == 401
 
 
-def test_edge_event_logging_stays_open_for_devices(db, broker):
+EDGE = User("service-account-imm-edge", frozenset({"edge_device"}))
+
+
+def test_event_logging_requires_edge_device(db, broker):
+    body = {"ph_level": 7.0, "water_temp_c": 22.5}
     eclss_api.app.dependency_overrides.clear()
-    r = client.post("/api/v1/biolab/log", json={"ph_level": 7.0, "water_temp_c": 22.5})
-    assert r.status_code == 201
+    assert client.post("/api/v1/biolab/log", json=body).status_code == 401
+    eclss_api.app.dependency_overrides[authenticated] = lambda: User("ev1", frozenset({"crew"}))
+    assert client.post("/api/v1/biolab/log", json=body).status_code == 403
+    eclss_api.app.dependency_overrides[authenticated] = lambda: EDGE
+    assert client.post("/api/v1/biolab/log", json=body).status_code == 201
+
+
+def test_edge_device_cannot_use_crew_lighting_controls(db, broker):
+    eclss_api.app.dependency_overrides.clear()
+    eclss_api.app.dependency_overrides[authenticated] = lambda: EDGE
+    assert client.put("/api/v1/eclss/lighting/lab", json={"brightness": 1, "kelvin": 3000}).status_code == 403
 
 
 def test_get_lighting_reads_db(db, broker):
@@ -156,6 +169,7 @@ def test_put_with_broker_down_stores_and_resyncs_on_connect(db, broker):
     ("/api/v1/biolab/log", {"ph_level": 7.0, "water_temp_c": 22.5}, "biolab_readings"),
 ])
 def test_event_endpoints_persist(db, broker, path, body, table):
+    eclss_api.app.dependency_overrides[authenticated] = lambda: EDGE
     r = client.post(path, json=body)
     assert r.status_code == 201
     assert r.json()["status"] == "logged"
@@ -164,4 +178,5 @@ def test_event_endpoints_persist(db, broker, path, body, table):
 
 
 def test_biolab_rejects_invalid_ph(db, broker):
+    eclss_api.app.dependency_overrides[authenticated] = lambda: EDGE
     assert client.post("/api/v1/biolab/log", json={"ph_level": 15, "water_temp_c": 20}).status_code == 422

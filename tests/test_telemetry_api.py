@@ -1,10 +1,25 @@
 """
 Telemetry API tests — uses TestClient; falls back to mock data (no real InfluxDB).
 """
+import pytest
 from fastapi.testclient import TestClient
 from main import app
+from services.auth import User, current_user
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def logged_in():
+    app.dependency_overrides[current_user] = lambda: User("capcom", frozenset({"mcc_operator"}))
+    yield
+    app.dependency_overrides.clear()
+
+
+def test_telemetry_requires_login():
+    app.dependency_overrides.clear()
+    assert client.get("/api/telemetry/nodes").status_code == 401
+    assert client.get("/health").status_code == 200  # liveness stays open for Docker/K3s
 
 
 def test_nodes_returns_list():

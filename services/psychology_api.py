@@ -19,7 +19,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from services.auth import (
     COMMANDER, FLIGHT_SURGEON, User, current_user, ensure_self_or_roles,
-    require_roles, service_headers,
+    require_roles, require_shared_secret, service_headers,
 )
 
 app = FastAPI(title="IMM Psychology API", version="1.0")
@@ -260,7 +260,7 @@ async def get_sleep(crew_id: str, days: int = 30, user: User = Depends(current_u
     }
 
 # Garmin/Fitbit webhook-compatible ingest
-@app.post("/api/v1/psych/sleep/webhook")
+@app.post("/api/v1/psych/sleep/webhook", dependencies=[Depends(require_shared_secret("SLEEP_WEBHOOK_TOKEN"))])
 async def sleep_webhook(payload: dict):
     """Accept Garmin Connect IQ or Fitbit sleep webhook. Parse and store."""
     # Fitbit format: payload["sleep"][0]

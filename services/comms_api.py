@@ -79,7 +79,7 @@ async def current_delay_seconds() -> float:
     """Fetch active comm delay from time-service."""
     try:
         async with httpx.AsyncClient(timeout=2) as client:
-            r = await client.get(f"{TIME_SVC}/api/v1/time/delay")
+            r = await client.get(f"{TIME_SVC}/api/v1/time/delay", headers=service_headers())
             d = r.json()
             mode = d.get("mode", "none")
             if mode == "custom":
@@ -91,7 +91,7 @@ async def current_delay_seconds() -> float:
 async def current_mission_day() -> int:
     try:
         async with httpx.AsyncClient(timeout=2) as client:
-            r = await client.get(f"{TIME_SVC}/api/v1/time/now")
+            r = await client.get(f"{TIME_SVC}/api/v1/time/now", headers=service_headers())
             d = r.json()
             ts = float(d.get("unix_ts", time.time()))
             return max(1, int((ts - 1710000000) / 86400))

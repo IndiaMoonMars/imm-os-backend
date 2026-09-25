@@ -12,9 +12,11 @@ import os
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from influxdb_client import InfluxDBClient
 from influxdb_client.client.exceptions import InfluxDBError
+
+from services.auth import current_user
 
 log = logging.getLogger("telemetry_api")
 
@@ -25,7 +27,7 @@ INFLUX_TOKEN  = os.getenv("INFLUX_TOKEN",  "imm-super-secret-token")
 INFLUX_ORG    = os.getenv("INFLUX_ORG",    "imm_org")
 INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "telemetry")
 
-router = APIRouter(prefix="/api/telemetry", tags=["Telemetry"])
+router = APIRouter(prefix="/api/telemetry", tags=["Telemetry"], dependencies=[Depends(current_user)])
 
 # Known node IDs (matches simulator config — real sensors use same IDs)
 KNOWN_NODES = [
