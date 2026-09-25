@@ -9,6 +9,7 @@ Handles:
   - Video / Audio log management
 """
 import os
+import re
 import json
 import asyncio
 import logging
@@ -50,6 +51,22 @@ TIME_SVC = os.getenv("TIME_SERVICE_URL", "http://time-service:8002")
 ECLSS_SVC = os.getenv("ECLSS_API_URL", "http://eclss-api:8003")
 MEDIA_DIR = os.getenv("MEDIA_DIR", "/app/media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
+
+
+def media_path(prefix: str, filename: Optional[str]) -> tuple:
+    """
+    Build (safe_name, absolute path) inside MEDIA_DIR from a server-side prefix
+    and a client-supplied filename: drop any directory part (/ or \\), keep
+    [A-Za-z0-9._-], and refuse anything that resolves outside MEDIA_DIR.
+    """
+    base = re.split(r"[\\/]", filename or "")[-1]
+    clean = re.sub(r"[^A-Za-z0-9._-]", "_", base).lstrip(".")[:150] or "upload"
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", f"{prefix}_{clean}")
+    root = os.path.realpath(MEDIA_DIR)
+    path = os.path.realpath(os.path.join(root, safe))
+    if os.path.dirname(path) != root:
+        raise HTTPException(400, "Invalid file name")
+    return safe, path
 
 DELAY_MAP = {"none": 0, "moon": 1.28, "mars": 480}   # seconds (scaled for demo; real = 480 s / 8 min)
 
@@ -305,8 +322,7 @@ async def upload_journal_media(journal_id: int, file: UploadFile = File(...),
     if author_id is None:
         raise HTTPException(404, "Journal not found")
     ensure_self_or_roles(user, author_id)
-    safe_name = f"journal_{journal_id}_{file.filename}"
-    path = os.path.join(MEDIA_DIR, safe_name)
+    safe_name, path = media_path(f"journal_{journal_id}", file.filename)
     with open(path, "wb") as f:
         f.write(await file.read())
     conn = await get_conn()
@@ -467,8 +483,7 @@ async def upload_video_log(
 ):
     ensure_self_or_roles(user, crew_id)
     mission_day = await current_mission_day()
-    safe_name = f"vlog_{crew_id}_{int(time.time())}_{file.filename}"
-    path = os.path.join(MEDIA_DIR, safe_name)
+    safe_name, path = media_path(f"vlog_{crew_id}_{int(time.time())}", file.filename)
     with open(path, "wb") as f:
         f.write(await file.read())
 
