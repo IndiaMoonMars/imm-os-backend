@@ -77,6 +77,9 @@ def main():
     ensure_topics()
 
     client = mqtt.Client(client_id="imm-mqtt-kafka-bridge", clean_session=True)
+    # Broker requires auth (allow_anonymous false); user/topics in imm-os-infra mosquitto/config/acl
+    if os.getenv("MQTT_USERNAME"):
+        client.username_pw_set(os.getenv("MQTT_USERNAME"), os.getenv("MQTT_PASSWORD"))
     client.on_connect = on_connect
     client.on_message = on_message
     client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
