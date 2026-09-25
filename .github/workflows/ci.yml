@@ -36,6 +36,17 @@ jobs:
     name: Test (pytest)
     needs: lint
     runs-on: ubuntu-latest
+    services:
+      # time_service delay-queue tests talk to a real Redis (REDIS_URL default localhost:6379)
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v3
 
