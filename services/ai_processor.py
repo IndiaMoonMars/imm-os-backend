@@ -110,7 +110,7 @@ def run_anomaly_detection(system_name: str):
             .tag("system", system_name)
             .tag("culprit", culprit)
             .field("score", float(score))
-            .time(window[-1]['ts'], WritePrecision.SECONDS)
+            .time(window[-1]['ts'], WritePrecision.S)
         )
         write_api.write(bucket=INFLUX_BUCKET, record=point)
         

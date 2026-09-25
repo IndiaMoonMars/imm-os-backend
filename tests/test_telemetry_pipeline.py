@@ -149,3 +149,14 @@ def test_history_rejects_unknown_names_before_querying(monkeypatch):
         assert queried == []
     finally:
         telemetry_ingest.app.dependency_overrides.clear()
+
+
+def test_processors_use_valid_influx_write_precision():
+    """WritePrecision.SECONDS doesn't exist; it crashed both processors on their first point."""
+    import re
+    from pathlib import Path
+    from influxdb_client import WritePrecision
+    for name in ("telemetry_processor.py", "ai_processor.py"):
+        src = (Path(__file__).parent.parent / "services" / name).read_text()
+        for attr in re.findall(r"WritePrecision\.(\w+)", src):
+            assert hasattr(WritePrecision, attr), f"{name}: WritePrecision.{attr}"

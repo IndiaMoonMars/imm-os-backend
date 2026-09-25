@@ -132,7 +132,7 @@ def process_message(raw: bytes):
             .tag("sol", sol_str)
             .tag("ist_date", ist_date)
             .field("value", float(value))
-            .time(ts, WritePrecision.SECONDS)
+            .time(ts, WritePrecision.S)
         )
 
         # Write to normal bucket
@@ -148,7 +148,7 @@ def process_message(raw: bytes):
                 .tag("zone", zone)
                 .field("value", float(value))
                 .field("zscore", z)
-                .time(ts, WritePrecision.SECONDS)
+                .time(ts, WritePrecision.S)
             )
             write_api.write(bucket=INFLUX_ALERTS_BUCKET, record=alert_point)
             
