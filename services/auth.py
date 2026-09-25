@@ -135,6 +135,13 @@ def edge_device(user: User = Depends(authenticated)) -> User:
     return user
 
 
+def crew_or_edge(user: User = Depends(authenticated)) -> User:
+    """Crew/MCC user, edge device (e.g. a scanner station) or internal service."""
+    if not (user.is_service or EDGE_DEVICE in user.roles or user.roles & IMM_ROLES):
+        raise HTTPException(403, "No IMM-OS role assigned to this account")
+    return user
+
+
 def require_shared_secret(env_var: str, header: str = "X-IMM-Webhook-Token"):
     """
     Dependency for third-party webhooks that can't obtain Keycloak tokens.
