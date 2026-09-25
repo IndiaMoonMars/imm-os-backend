@@ -160,3 +160,40 @@ def test_processors_use_valid_influx_write_precision():
         src = (Path(__file__).parent.parent / "services" / name).read_text()
         for attr in re.findall(r"WritePrecision\.(\w+)", src):
             assert hasattr(WritePrecision, attr), f"{name}: WritePrecision.{attr}"
+
+
+# ── EVA streams (eva.raw) ──────────────────────────────────────────
+
+def test_eva_biosensor_frame_is_validated_with_crew_from_topic():
+    msg = {"crew_id": "ev1", "sensor": "eva_biosensor", "hr_bpm": 88.0, "spo2_pct": 97.5,
+           "skin_temp_c": 36.4, "ecg_mv": 1650.0, "timestamp": NOW}
+    topic, key, value = route(b"habitat/eva/biosensors/ev1", json.dumps(msg).encode())
+    assert topic == VALIDATED_TOPIC and key == b"eva_biosensor"
+    data = json.loads(value)["data"]
+    assert data["crew_id"] == "ev1" and data["zone"] == "eva" and data["skin_temp_c"] == 36.4
+
+
+def test_eva_biosensor_crew_mismatch_rejected():
+    msg = {"crew_id": "ev2", "hr_bpm": 90, "timestamp": NOW}
+    assert route(b"habitat/eva/biosensors/ev1", json.dumps(msg).encode())[0] == DEADLETTER_TOPIC
+
+
+def test_eva_biosensor_sensor_only_on_eva_topic():
+    msg = {"sensor": "eva_biosensor", "hr_bpm": 90, "timestamp": NOW}
+    assert route(b"habitat/sensors/eva_biosensor/zone1", json.dumps(msg).encode())[0] == DEADLETTER_TOPIC
+
+
+def test_eva_position_frames_forwarded_for_openmct():
+    msg = {"crew_id": "ev1", "mode": "uwb", "x_m": 3.2, "y_m": 4.1, "z_m": 1.2, "quality": 90, "timestamp": NOW}
+    topic, key, value = route(b"habitat/eva/position/ev1", json.dumps(msg).encode())
+    data = json.loads(value)["data"]
+    assert topic == VALIDATED_TOPIC and key == b"eva_position/ev1"
+    assert data == {"crew_id": "ev1", "mode": "uwb", "x_m": 3.2, "y_m": 4.1, "z_m": 1.2, "quality": 90.0, "timestamp": NOW}
+    assert "sensor" not in data   # OpenMCT's EVA tracker treats sensor-less frames as positions
+    bad = dict(msg, mode="gps")   # gps mode without lat/lon
+    assert route(b"habitat/eva/position/ev1", json.dumps(bad).encode())[0] == DEADLETTER_TOPIC
+
+
+def test_raw_gps_and_uwb_are_fusion_inputs_not_telemetry():
+    assert route(b"habitat/eva/gps", b'{"crew_id":"ev1","lat":1,"lon":2}') is None
+    assert route(b"habitat/eva/uwb", b'{"crew_id":"ev1","x_m":1,"y_m":2}') is None

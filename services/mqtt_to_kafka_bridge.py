@@ -42,10 +42,14 @@ def delivery_report(err, msg):
 def ensure_topics():
     admin = AdminClient({"bootstrap.servers": KAFKA_BOOTSTRAP})
     existing = admin.list_topics(timeout=10).topics
-    for topic in (RAW_TOPIC, EVA_RAW_TOPIC):
-        if topic not in existing:
-            admin.create_topics([NewTopic(topic, num_partitions=3, replication_factor=1)])
-            log.info("Created Kafka topic: %s", topic)
+    missing = [t for t in (RAW_TOPIC, EVA_RAW_TOPIC) if t not in existing]
+    if missing:
+        for topic, fut in admin.create_topics([NewTopic(t, num_partitions=3, replication_factor=1) for t in missing]).items():
+            try:
+                fut.result(timeout=15)
+                log.info("Created Kafka topic: %s", topic)
+            except Exception as exc:  # already created by the validator
+                log.info("Kafka topic %s: %s", topic, exc)
 
 # ── MQTT Callbacks ─────────────────────────────────────────────────
 def on_connect(client, userdata, flags, rc):

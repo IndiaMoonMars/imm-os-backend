@@ -163,6 +163,7 @@ def main():
     consumer = Consumer({
         "bootstrap.servers": KAFKA_BOOTSTRAP,
         "group.id": KAFKA_GROUP_ID,
+        "topic.metadata.refresh.interval.ms": 10000,  # topics may be created after start-up
         "auto.offset.reset": "earliest",
         "enable.auto.commit": True,
     })

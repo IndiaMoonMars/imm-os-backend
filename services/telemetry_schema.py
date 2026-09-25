@@ -30,6 +30,7 @@ class SensorType(str, Enum):
     o2 = "o2"                  # electrochemical O₂ cell via ADS1115
     jetson = "jetson"          # Jetson on-board CPU/GPU temperature and power
     bms = "bms"                # battery management / solar input
+    eva_biosensor = "eva_biosensor"  # EVA suit vitals (habitat/eva/biosensors/<crew>)
 
 
 class TelemetryPayload(BaseModel):
@@ -39,6 +40,7 @@ class TelemetryPayload(BaseModel):
     # provenance
     node_id: Optional[str] = Field(None, max_length=64)
     zone: Optional[str] = Field(None, max_length=64)
+    crew_id: Optional[str] = Field(None, max_length=64)
     simulated: bool = False
     # data fields
     temp: Optional[float] = None
@@ -59,6 +61,8 @@ class TelemetryPayload(BaseModel):
     power_w: Optional[float] = None
     battery_pct: Optional[float] = None
     solar_w: Optional[float] = None
+    skin_temp_c: Optional[float] = None
+    ecg_mv: Optional[float] = None
 
     @validator("timestamp")
     def timestamp_reasonable(cls, v):
@@ -79,6 +83,7 @@ SENSOR_METRICS: Dict[str, List[str]] = {
     "o2": ["o2_pct"],
     "jetson": ["cpu_temp", "gpu_temp", "power_w"],
     "bms": ["battery_pct", "solar_w"],
+    "eva_biosensor": ["hr_bpm", "spo2_pct", "skin_temp_c"],
 }
 
 # (sensor, metric) → (dashboard measurement, unit). The first sensor listed for a
@@ -117,6 +122,41 @@ def _topic_parts(topic: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+class NotTelemetry(Exception):
+    """A message the pipeline deliberately doesn't forward (e.g. raw GPS/UWB fusion inputs)."""
+
+
+def _eva_topic(topic: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """habitat/eva/<kind>[/<crew>] → (kind, crew)."""
+    parts = (topic or "").split("/")
+    if len(parts) >= 3 and parts[0] == "habitat" and parts[1] == "eva":
+        return parts[2], (parts[3].lower() if len(parts) > 3 else None)
+    return None, None
+
+
+def normalise_eva_position(message: dict, crew: str) -> dict:
+    """Fused EVA position (habitat/eva/position/<crew>) → dict for OpenMCT's EVA tracker."""
+    if not isinstance(message, dict):
+        raise InvalidTelemetry("payload is not a JSON object")
+    if str(message.get("crew_id", crew)).lower() != crew:
+        raise InvalidTelemetry("crew_id does not match topic")
+    mode = message.get("mode")
+    fields = {"uwb": ("x_m", "y_m"), "gps": ("lat", "lon")}.get(mode)
+    if not fields:
+        raise InvalidTelemetry(f"unknown position mode {mode!r}")
+    out = {"crew_id": crew, "mode": mode}
+    try:
+        for k in fields + ("z_m", "quality", "timestamp"):
+            if k in message:
+                out[k] = float(message[k]) if k != "timestamp" else int(message[k])
+    except (TypeError, ValueError) as exc:
+        raise InvalidTelemetry(f"bad number in position: {exc}") from exc
+    if not all(k in out for k in fields):
+        raise InvalidTelemetry(f"{mode} position needs {fields}")
+    out.setdefault("timestamp", int(time.time()))
+    return out
+
+
 def normalise(message: dict, topic: Optional[str] = None) -> dict:
     """
     Validate one reading and return the canonical dict published to telemetry.validated.
@@ -131,6 +171,21 @@ def normalise(message: dict, topic: Optional[str] = None) -> dict:
     if not isinstance(data, dict):
         raise InvalidTelemetry("data is not a JSON object")
     data = dict(data)
+    eva_kind, eva_crew = _eva_topic(topic)
+    if eva_kind in ("gps", "uwb"):
+        raise NotTelemetry("raw positioning input (fused into habitat/eva/position)")
+    if eva_kind == "position":
+        return normalise_eva_position(data, eva_crew or "")
+    if eva_kind == "biosensors":
+        if data.get("sensor") not in (None, "eva_biosensor"):
+            raise InvalidTelemetry("EVA biosensor topic carries a non-EVA sensor")
+        if eva_crew and str(data.get("crew_id", eva_crew)).lower() != eva_crew:
+            raise InvalidTelemetry("crew_id does not match topic")
+        data["sensor"] = "eva_biosensor"
+        data["crew_id"] = eva_crew or data.get("crew_id")
+        data.setdefault("zone", "eva")
+    elif data.get("sensor") == "eva_biosensor":
+        raise InvalidTelemetry("eva_biosensor readings must use habitat/eva/biosensors/<crew>")
     t_sensor, t_zone = _topic_parts(topic)
     if t_sensor:
         if data.get("sensor") not in (None, t_sensor):

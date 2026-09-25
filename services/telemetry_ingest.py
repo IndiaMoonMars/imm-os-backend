@@ -76,6 +76,7 @@ def kafka_ws_consumer_loop(loop):
     consumer = Consumer({
         "bootstrap.servers": KAFKA_BOOTSTRAP,
         "group.id": "openmct_ws_broadcaster",
+        "topic.metadata.refresh.interval.ms": 10000,  # topics may be created after start-up
         "auto.offset.reset": "latest",
     })
     consumer.subscribe([VALIDATED_TOPIC])

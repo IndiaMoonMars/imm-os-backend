@@ -127,6 +127,7 @@ def process_message(raw: bytes):
             .tag("zone", zone)
             .tag("node_id", node_id)
             .tag("simulated", simulated)
+            .tag("crew_id", str(data.get("crew_id") or "-"))
             .tag("metric", metric)
             .tag("mission_day", mission_day)
             .tag("sol", sol_str)
@@ -214,6 +215,7 @@ def main():
     consumer = Consumer({
         "bootstrap.servers": KAFKA_BOOTSTRAP,
         "group.id": KAFKA_GROUP_ID,
+        "topic.metadata.refresh.interval.ms": 10000,  # topics may be created after start-up
         "auto.offset.reset": "earliest",
         "enable.auto.commit": True,
     })
