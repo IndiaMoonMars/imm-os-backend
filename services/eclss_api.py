@@ -21,9 +21,11 @@ from typing import Dict
 
 import asyncpg
 import paho.mqtt.client as mqtt
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, conint, confloat
+
+from services.auth import current_user
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [eclss_api] %(message)s")
 log = logging.getLogger(__name__)
@@ -145,7 +147,7 @@ class BiolabEvent(BaseModel):
 
 # ── Lighting ──────────────────────────────────────────────────────
 
-@app.get("/api/v1/eclss/lighting")
+@app.get("/api/v1/eclss/lighting", dependencies=[Depends(current_user)])
 async def get_lighting_state():
     conn = await get_conn()
     try:
@@ -154,7 +156,7 @@ async def get_lighting_state():
         await conn.close()
 
 
-@app.put("/api/v1/eclss/lighting/{zone}")
+@app.put("/api/v1/eclss/lighting/{zone}", dependencies=[Depends(current_user)])
 async def set_lighting_state(zone: str, state: LightingUpdate):
     new = {"brightness": state.brightness, "kelvin": state.kelvin}
     conn = await get_conn()

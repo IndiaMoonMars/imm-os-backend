@@ -16,6 +16,8 @@ import asyncpg
 import asyncio
 from datetime import datetime, timezone, timedelta
 
+from services.auth import service_headers
+
 # Enforce IST globally across logging outputs
 ist_tz = timezone(timedelta(hours=5, minutes=30))
 logging.Formatter.converter = lambda *args: datetime.now(ist_tz).timetuple()
@@ -68,7 +70,7 @@ async def evaluate_policies():
                         await client.put(f"{ECLSS_API_URL}/api/v1/eclss/lighting/all", json={
                             "brightness": 100,
                             "kelvin": 6000
-                        })
+                        }, headers=service_headers())
                         await log_action(conn, insight['id'], "hvac_adjust", action_text, reason)
                     except Exception as e:
                         log.error(f"Failed to execute CO2 mitigation: {e}")
@@ -84,7 +86,7 @@ async def evaluate_policies():
                         await client.put(f"{ECLSS_API_URL}/api/v1/eclss/lighting/lab", json={
                             "brightness": 50,
                             "kelvin": 3000
-                        })
+                        }, headers=service_headers())
                         await log_action(conn, insight['id'], "power_shed", action_text, reason)
                     except Exception as e:
                         log.error(f"Failed to execute power shed: {e}")

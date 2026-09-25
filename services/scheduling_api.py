@@ -22,11 +22,13 @@ from typing import Optional, List
 
 import asyncpg
 import httpx
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from services.auth import current_user, service_headers
 
 # ── Logging (IST) ─────────────────────────────────────────────────
 ist_tz = timezone(timedelta(hours=5, minutes=30))
@@ -73,7 +75,7 @@ class ProjectCreate(BaseModel):
 class StatusUpdate(BaseModel):
     status: str
 
-@app.post("/api/v1/scheduling/projects", status_code=201)
+@app.post("/api/v1/scheduling/projects", dependencies=[Depends(current_user)], status_code=201)
 async def create_project(p: ProjectCreate):
     mday = await current_mission_day()
     conn = await get_conn()
@@ -85,7 +87,7 @@ async def create_project(p: ProjectCreate):
         return {"project_id": row["id"]}
     finally: await conn.close()
 
-@app.get("/api/v1/scheduling/projects")
+@app.get("/api/v1/scheduling/projects", dependencies=[Depends(current_user)])
 async def list_projects(status: Optional[str] = None):
     conn = await get_conn()
     try:
@@ -98,7 +100,7 @@ async def list_projects(status: Optional[str] = None):
         return [dict(r) for r in await conn.fetch(q, *params)]
     finally: await conn.close()
 
-@app.patch("/api/v1/scheduling/projects/{pid}/status")
+@app.patch("/api/v1/scheduling/projects/{pid}/status", dependencies=[Depends(current_user)])
 async def update_project_status(pid: int, upd: StatusUpdate):
     conn = await get_conn()
     try:
@@ -125,7 +127,7 @@ class TaskUpdate(BaseModel):
     deadline: Optional[datetime] = None
     priority: Optional[str] = None
 
-@app.post("/api/v1/scheduling/tasks", status_code=201)
+@app.post("/api/v1/scheduling/tasks", dependencies=[Depends(current_user)], status_code=201)
 async def create_task(t: TaskCreate):
     mday = await current_mission_day()
     conn = await get_conn()
@@ -138,7 +140,7 @@ async def create_task(t: TaskCreate):
         return {"task_id": row["id"]}
     finally: await conn.close()
 
-@app.get("/api/v1/scheduling/tasks")
+@app.get("/api/v1/scheduling/tasks", dependencies=[Depends(current_user)])
 async def list_tasks(project_id: Optional[int] = None,
                      assignee_id: Optional[str] = None,
                      status: Optional[str] = None):
@@ -156,7 +158,7 @@ async def list_tasks(project_id: Optional[int] = None,
         return [dict(r) for r in rows]
     finally: await conn.close()
 
-@app.patch("/api/v1/scheduling/tasks/{tid}")
+@app.patch("/api/v1/scheduling/tasks/{tid}", dependencies=[Depends(current_user)])
 async def update_task(tid: int, upd: TaskUpdate):
     conn = await get_conn()
     try:
@@ -174,7 +176,7 @@ async def update_task(tid: int, upd: TaskUpdate):
         return {"updated": True}
     finally: await conn.close()
 
-@app.get("/api/v1/scheduling/carryover")
+@app.get("/api/v1/scheduling/carryover", dependencies=[Depends(current_user)])
 async def carry_over_tasks():
     """Incomplete tasks from previous mission days — fed into daily briefings."""
     mday = await current_mission_day()
@@ -199,7 +201,7 @@ class MilestoneCreate(BaseModel):
     name: str
     target_date: date
 
-@app.post("/api/v1/scheduling/milestones", status_code=201)
+@app.post("/api/v1/scheduling/milestones", dependencies=[Depends(current_user)], status_code=201)
 async def create_milestone(m: MilestoneCreate):
     conn = await get_conn()
     try:
@@ -209,7 +211,7 @@ async def create_milestone(m: MilestoneCreate):
         return {"milestone_id": row["id"]}
     finally: await conn.close()
 
-@app.get("/api/v1/scheduling/milestones")
+@app.get("/api/v1/scheduling/milestones", dependencies=[Depends(current_user)])
 async def list_milestones(project_id: Optional[int] = None):
     conn = await get_conn()
     try:
@@ -221,7 +223,7 @@ async def list_milestones(project_id: Optional[int] = None):
         return [dict(r) for r in await conn.fetch(q, *params)]
     finally: await conn.close()
 
-@app.patch("/api/v1/scheduling/milestones/{mid}/reach")
+@app.patch("/api/v1/scheduling/milestones/{mid}/reach", dependencies=[Depends(current_user)])
 async def reach_milestone(mid: int):
     conn = await get_conn()
     try:
@@ -242,7 +244,7 @@ class ProcedureCreate(BaseModel):
     steps: List[dict]   # [{title, detail, caution?}]
     created_by: str
 
-@app.post("/api/v1/scheduling/procedures", status_code=201)
+@app.post("/api/v1/scheduling/procedures", dependencies=[Depends(current_user)], status_code=201)
 async def create_procedure(proc: ProcedureCreate):
     conn = await get_conn()
     try:
@@ -254,7 +256,7 @@ async def create_procedure(proc: ProcedureCreate):
         return {"procedure_id": row["id"]}
     finally: await conn.close()
 
-@app.get("/api/v1/scheduling/procedures")
+@app.get("/api/v1/scheduling/procedures", dependencies=[Depends(current_user)])
 async def list_procedures(category: Optional[str] = None):
     conn = await get_conn()
     try:
@@ -264,7 +266,7 @@ async def list_procedures(category: Optional[str] = None):
         return [dict(r) for r in await conn.fetch(q, *params)]
     finally: await conn.close()
 
-@app.get("/api/v1/scheduling/procedures/{pid}")
+@app.get("/api/v1/scheduling/procedures/{pid}", dependencies=[Depends(current_user)])
 async def get_procedure(pid: int):
     conn = await get_conn()
     try:
@@ -280,7 +282,7 @@ class RunCreate(BaseModel):
     crew_id: str
     task_id: Optional[int] = None
 
-@app.post("/api/v1/scheduling/procedures/run", status_code=201)
+@app.post("/api/v1/scheduling/procedures/run", dependencies=[Depends(current_user)], status_code=201)
 async def start_run(req: RunCreate):
     conn = await get_conn()
     try:
@@ -291,7 +293,7 @@ async def start_run(req: RunCreate):
         return {"run_id": row["id"]}
     finally: await conn.close()
 
-@app.get("/api/v1/scheduling/runs/{run_id}")
+@app.get("/api/v1/scheduling/runs/{run_id}", dependencies=[Depends(current_user)])
 async def get_run(run_id: int):
     conn = await get_conn()
     try:
@@ -316,7 +318,7 @@ async def get_run(run_id: int):
 class StepComplete(BaseModel):
     crew_id: str
 
-@app.post("/api/v1/scheduling/runs/{run_id}/step")
+@app.post("/api/v1/scheduling/runs/{run_id}/step", dependencies=[Depends(current_user)])
 async def complete_step(run_id: int, req: StepComplete):
     conn = await get_conn()
     try:
@@ -345,7 +347,7 @@ async def complete_step(run_id: int, req: StepComplete):
         }
     finally: await conn.close()
 
-@app.post("/api/v1/scheduling/runs/{run_id}/abort")
+@app.post("/api/v1/scheduling/runs/{run_id}/abort", dependencies=[Depends(current_user)])
 async def abort_run(run_id: int):
     conn = await get_conn()
     try:
@@ -400,7 +402,7 @@ async def generate_daily_report():
                 "recipient_group": "mcc",
                 "subject": f"Daily Summary Report — Mission Day {mday}",
                 "body": report_body,
-            })
+            }, headers=service_headers())
         log.info(f"Daily report dispatched to MCC (Mission Day {mday}).")
     except Exception as e:
         log.error(f"Failed to send daily report: {e}")
@@ -444,7 +446,7 @@ async def startup():
 async def shutdown():
     scheduler.shutdown()
 
-@app.post("/api/v1/scheduling/report/trigger")
+@app.post("/api/v1/scheduling/report/trigger", dependencies=[Depends(current_user)])
 async def trigger_report_now(background_tasks: BackgroundTasks):
     """Manual trigger for testing (does not wait for 23:00)."""
     background_tasks.add_task(generate_daily_report)

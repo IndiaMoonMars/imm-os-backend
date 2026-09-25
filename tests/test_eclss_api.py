@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from services import eclss_api
+from services.auth import User, current_user
 
 
 class FakeTx:
@@ -78,7 +79,26 @@ def broker(monkeypatch):
     return fake
 
 
+@pytest.fixture(autouse=True)
+def logged_in():
+    eclss_api.app.dependency_overrides[current_user] = lambda: User("ev1", frozenset({"crew"}))
+    yield
+    eclss_api.app.dependency_overrides.clear()
+
+
 client = TestClient(eclss_api.app)
+
+
+def test_lighting_requires_login(db, broker):
+    eclss_api.app.dependency_overrides.clear()
+    assert client.get("/api/v1/eclss/lighting").status_code == 401
+    assert client.put("/api/v1/eclss/lighting/lab", json={"brightness": 1, "kelvin": 3000}).status_code == 401
+
+
+def test_edge_event_logging_stays_open_for_devices(db, broker):
+    eclss_api.app.dependency_overrides.clear()
+    r = client.post("/api/v1/biolab/log", json={"ph_level": 7.0, "water_temp_c": 22.5})
+    assert r.status_code == 201
 
 
 def test_get_lighting_reads_db(db, broker):

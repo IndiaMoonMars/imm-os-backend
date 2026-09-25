@@ -13,9 +13,11 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 import asyncpg
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from services.auth import current_user
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [eva_api] %(message)s")
 log = logging.getLogger(__name__)
@@ -62,7 +64,7 @@ class ToolScan(BaseModel):
 
 # ── EVA Plan routes ───────────────────────────────────────────────
 
-@app.post("/api/v1/eva/plan", status_code=201)
+@app.post("/api/v1/eva/plan", dependencies=[Depends(current_user)], status_code=201)
 async def create_eva_plan(plan: EvaPlanCreate):
     conn = await get_conn()
     try:
@@ -84,7 +86,7 @@ async def create_eva_plan(plan: EvaPlanCreate):
     finally:
         await conn.close()
 
-@app.get("/api/v1/eva/plans")
+@app.get("/api/v1/eva/plans", dependencies=[Depends(current_user)])
 async def list_eva_plans():
     conn = await get_conn()
     try:
@@ -93,7 +95,7 @@ async def list_eva_plans():
     finally:
         await conn.close()
 
-@app.get("/api/v1/eva/plan/{plan_id}")
+@app.get("/api/v1/eva/plan/{plan_id}", dependencies=[Depends(current_user)])
 async def get_eva_plan(plan_id: int):
     conn = await get_conn()
     try:
@@ -104,7 +106,7 @@ async def get_eva_plan(plan_id: int):
     finally:
         await conn.close()
 
-@app.patch("/api/v1/eva/plan/{plan_id}/status")
+@app.patch("/api/v1/eva/plan/{plan_id}/status", dependencies=[Depends(current_user)])
 async def update_plan_status(plan_id: int, update: EvaPlanStatusUpdate):
     conn = await get_conn()
     try:
@@ -117,7 +119,7 @@ async def update_plan_status(plan_id: int, update: EvaPlanStatusUpdate):
     finally:
         await conn.close()
 
-@app.patch("/api/v1/eva/plan/{plan_id}/checklist")
+@app.patch("/api/v1/eva/plan/{plan_id}/checklist", dependencies=[Depends(current_user)])
 async def update_checklist(plan_id: int, update: ChecklistUpdate):
     import json as _json
     conn = await get_conn()
@@ -155,7 +157,7 @@ async def register_tool(tool: ToolRegister):
     finally:
         await conn.close()
 
-@app.get("/api/v1/eva/tools")
+@app.get("/api/v1/eva/tools", dependencies=[Depends(current_user)])
 async def list_tools():
     conn = await get_conn()
     try:
