@@ -42,10 +42,14 @@ def delivery_report(err, msg):
 def ensure_topics():
     admin = AdminClient({"bootstrap.servers": KAFKA_BOOTSTRAP})
     existing = admin.list_topics(timeout=10).topics
-    for topic in (RAW_TOPIC, EVA_RAW_TOPIC):
-        if topic not in existing:
-            admin.create_topics([NewTopic(topic, num_partitions=3, replication_factor=1)])
-            log.info("Created Kafka topic: %s", topic)
+    missing = [t for t in (RAW_TOPIC, EVA_RAW_TOPIC) if t not in existing]
+    if missing:
+        for topic, fut in admin.create_topics([NewTopic(t, num_partitions=3, replication_factor=1) for t in missing]).items():
+            try:
+                fut.result(timeout=15)
+                log.info("Created Kafka topic: %s", topic)
+            except Exception as exc:  # already created by the validator
+                log.info("Kafka topic %s: %s", topic, exc)
 
 # ── MQTT Callbacks ─────────────────────────────────────────────────
 def on_connect(client, userdata, flags, rc):
@@ -77,6 +81,11 @@ def main():
     ensure_topics()
 
     client = mqtt.Client(client_id="imm-mqtt-kafka-bridge", clean_session=True)
+    # Broker requires auth (allow_anonymous false); user/topics in imm-os-infra mosquitto/config/acl
+    if os.getenv("MQTT_USERNAME"):
+        client.username_pw_set(os.getenv("MQTT_USERNAME"), os.getenv("MQTT_PASSWORD"))
+    if os.getenv("MQTT_TLS_CA"):  # broker TLS listener (8883); verifies cert + hostname
+        client.tls_set(ca_certs=os.getenv("MQTT_TLS_CA"))
     client.on_connect = on_connect
     client.on_message = on_message
     client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)

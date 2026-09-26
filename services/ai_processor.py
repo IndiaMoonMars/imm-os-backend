@@ -110,7 +110,7 @@ def run_anomaly_detection(system_name: str):
             .tag("system", system_name)
             .tag("culprit", culprit)
             .field("score", float(score))
-            .time(window[-1]['ts'], WritePrecision.SECONDS)
+            .time(window[-1]['ts'], WritePrecision.S)
         )
         write_api.write(bucket=INFLUX_BUCKET, record=point)
         
@@ -163,6 +163,7 @@ def main():
     consumer = Consumer({
         "bootstrap.servers": KAFKA_BOOTSTRAP,
         "group.id": KAFKA_GROUP_ID,
+        "topic.metadata.refresh.interval.ms": 10000,  # topics may be created after start-up
         "auto.offset.reset": "earliest",
         "enable.auto.commit": True,
     })

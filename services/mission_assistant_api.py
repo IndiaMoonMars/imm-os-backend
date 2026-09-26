@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
@@ -7,6 +7,8 @@ import logging
 import asyncpg
 from datetime import datetime, timezone, timedelta
 from influxdb_client import InfluxDBClient
+
+from services.auth import User, current_user
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [astra] %(message)s")
 log = logging.getLogger(__name__)
@@ -109,8 +111,8 @@ def generate_astra_response(query_text: str, state: dict, trends: dict) -> Astra
 # ── Endpoints ───────────────────────────────────────────────────────
 
 @app.post("/api/v1/astra/query", response_model=AstraResponse)
-async def query_astra(payload: AstraQuery):
-    log.info(f"Query from {payload.crew_id}: {payload.query}")
+async def query_astra(payload: AstraQuery, user: User = Depends(current_user)):
+    log.info(f"Query from {user.username}: {payload.query}")
     
     # 1. Gather Context
     state = await get_mission_state()

@@ -36,8 +36,41 @@ jobs:
     name: Test (pytest)
     needs: lint
     runs-on: ubuntu-latest
+    services:
+      # time_service delay-queue tests talk to a real Redis (REDIS_URL default localhost:6379)
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      # Inventory integration tests run against the real schema (imm-os-infra init.sql)
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: admin
+          POSTGRES_PASSWORD: changeme
+          POSTGRES_DB: imm_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U admin -d imm_db"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v3
+
+      - name: Fetch infra schema (same-named branch if it exists, else main)
+        run: |
+          ref="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          url=https://github.com/IndiaMoonMars/imm-os-infra.git
+          git ls-remote --exit-code --heads "$url" "$ref" >/dev/null || ref=main
+          echo "Using imm-os-infra@$ref"
+          git clone --depth 1 --branch "$ref" "$url" ../imm-os-infra
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -50,6 +83,9 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run tests
+        env:
+          IMM_TEST_DATABASE_URL: postgresql://admin:changeme@127.0.0.1:5432/imm_db
+          IMM_INIT_SQL: ../imm-os-infra/postgres/init.sql
         run: |
           pytest tests/ -v --tb=short
 

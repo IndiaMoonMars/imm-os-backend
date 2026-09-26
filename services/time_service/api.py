@@ -3,11 +3,13 @@ import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 
-from math_engine import calculate_all, convert_tz
-import delay_queue
+# Package imports: compose runs `uvicorn services.time_service.api:app` from /app
+from services.time_service.math_engine import calculate_all, convert_tz
+import services.time_service.delay_queue as delay_queue
+from services.auth import COMMANDER, MCC_OPERATOR, current_user, require_roles
 
 ist_tz = timezone(timedelta(hours=5, minutes=30))
 logging.Formatter.converter = lambda *args: datetime.now(ist_tz).timetuple()
@@ -33,12 +35,12 @@ async def startup_event():
 def health():
     return {"status": "ok"}
 
-@app.get("/api/v1/time/now")
+@app.get("/api/v1/time/now", dependencies=[Depends(current_user)])
 def get_time_now():
     """Returns current time in IST, UTC, LST, CMT, MSD simultaneously"""
     return calculate_all(time.time())
 
-@app.get("/api/v1/time/convert")
+@app.get("/api/v1/time/convert", dependencies=[Depends(current_user)])
 def time_convert(from_tz: str, to_tz: str, ts: float):
     """Converts any timestamp between supported planetary zones."""
     supported = ["utc", "ist", "lst", "msd", "cmt"]
@@ -49,7 +51,7 @@ def time_convert(from_tz: str, to_tz: str, ts: float):
     # The 'convert_tz' function computes properties at 'ts'.
     return convert_tz(from_tz.lower(), to_tz.lower(), ts)
 
-@app.post("/api/v1/time/delay/config")
+@app.post("/api/v1/time/delay/config", dependencies=[Depends(require_roles(COMMANDER, MCC_OPERATOR))])
 async def set_delay_config(req: DelayConfigReq):
     if req.mode not in ["none", "moon", "mars", "custom"]:
         raise HTTPException(status_code=400, detail="Invalid mode. Supported: none, moon, mars, custom")
@@ -58,11 +60,11 @@ async def set_delay_config(req: DelayConfigReq):
         
     return await delay_queue.set_delay_config(req.mode, req.custom_val)
 
-@app.get("/api/v1/time/delay")
+@app.get("/api/v1/time/delay", dependencies=[Depends(current_user)])
 async def get_delay():
     return await delay_queue.get_delay_config()
 
-@app.post("/api/v1/time/delay/queue/test_push")
+@app.post("/api/v1/time/delay/queue/test_push", dependencies=[Depends(require_roles(MCC_OPERATOR))])
 async def test_queue_push(req: QueueTestReq):
     return await delay_queue.enqueue_message(req.message_id, req.payload)
 
