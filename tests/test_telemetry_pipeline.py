@@ -274,3 +274,61 @@ def test_sensor_snapshot_groups_every_metric():
     assert ina["metrics"] == {"voltage_v": 12.1, "current_ma": 850} and ina["simulated"] is False
     assert ina["timestamp"] == "2026-09-26T10:00:02+00:00"
     assert next(s for s in snap if s["sensor"] == "sysmon")["crew_id"] is None
+
+
+# ── ESP32 sensor board: BNO055 IMU and MQ-4 methane (esp32_bridge.py) ──
+
+def test_bno055_and_mq4_readings_validate():
+    imu = {"sensor": "bno055", "heading_deg": 182.3, "roll_deg": -5.0, "pitch_deg": 2.0, "lin_acc_ms2": 0.04,
+           "imu_calib": 3, "timestamp": NOW}
+    assert normalise(imu, "habitat/sensors/bno055/zone_a")["imu_calib"] == 3
+    gas = {"sensor": "mq4", "vout_mv": 930.0, "rs_r0": 4.4, "ch4_ppm": 16.5, "timestamp": NOW}
+    assert normalise(gas, "habitat/sensors/mq4/zone_a")["ch4_ppm"] == 16.5
+    # before warm-up/calibration the board sends only the voltage
+    assert "ch4_ppm" not in normalise({"sensor": "mq4", "vout_mv": 930.0, "timestamp": NOW}, "habitat/sensors/mq4/zone_a")
+
+
+@pytest.mark.parametrize("bad", [{"heading_deg": 400}, {"roll_deg": -200}, {"imu_calib": 4}])
+def test_bno055_out_of_range_is_rejected(bad):
+    with pytest.raises(InvalidTelemetry):
+        normalise({"sensor": "bno055", "heading_deg": 10.0, "timestamp": NOW, **bad}, "habitat/sensors/bno055/zone_a")
+
+
+@pytest.mark.parametrize("bad", [{"ch4_ppm": -1}, {"vout_mv": 9000}])
+def test_mq4_out_of_range_is_rejected(bad):
+    with pytest.raises(InvalidTelemetry):
+        normalise({"sensor": "mq4", "vout_mv": 900.0, "timestamp": NOW, **bad}, "habitat/sensors/mq4/zone_a")
+
+
+def test_merge_maps_methane():
+    out = merge_pipeline_records([rec("mq4", "ch4_ppm", 12.5)])
+    assert out["node-rpi-01"]["methane"]["value"] == 12.5 and out["node-rpi-01"]["methane"]["unit"] == "ppm"
+
+
+def test_methane_alarm_and_no_imu_zscore(monkeypatch):
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent / "services"))
+    from services import telemetry_processor as tp
+    monkeypatch.setattr(tp.write_api, "write", lambda bucket, record: written.append(bucket))
+    alarms, written = [], []
+
+    class FakeConn:
+        async def execute(self, sql, *args):
+            alarms.append(args[:3])
+
+        async def close(self):
+            pass
+
+    async def connect(**kw):
+        return FakeConn()
+    monkeypatch.setattr(tp.asyncpg, "connect", connect)
+    base = float(int(time.time()))
+    for i in range(31):   # steady, then someone turns the board: a 30-sigma jump that is not an anomaly
+        tp.process_message(json.dumps({"sensor": "bno055", "heading_deg": 180.0 if i == 30 else 10.0 + (i % 2) * 0.5,
+                                       "timestamp": base + i, "zone": "zone_x", "node_id": "node-rpi-01"}).encode())
+    assert "habitat_alerts" not in written
+    for ppm in (800.0, 6200.0):
+        tp.process_message(json.dumps({"sensor": "mq4", "ch4_ppm": ppm, "timestamp": base + 50,
+                                       "zone": "zone_a", "node_id": "node-rpi-01"}).encode())
+    assert alarms == [("mq4", "ch4_ppm", 6200.0)]

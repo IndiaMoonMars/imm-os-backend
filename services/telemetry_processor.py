@@ -45,7 +45,7 @@ INFLUX_ALERTS_BUCKET = "habitat_alerts"
 ZSCORE_WINDOW      = 60   # samples per rolling window
 ZSCORE_THRESHOLD   = 3.0  # standard deviations for anomaly
 # Waveforms: every heartbeat's R-peak is a >3σ "anomaly"; hard limits still apply.
-NO_ZSCORE_SENSORS  = {"ecg_ad8232"}
+NO_ZSCORE_SENSORS  = {"ecg_ad8232", "bno055"}   # waveform / orientation: large swings are normal
 
 # ── InfluxDB client ─────────────────────────────────────────────────
 influx   = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
@@ -170,6 +170,8 @@ def process_message(raw: bytes):
             hard_limit_breached = True; breach_reason = f"O\u2082 out of range: {value}%"
         elif sensor == "mq7" and metric == "co_ppm" and value > 35.0:
             hard_limit_breached = True; breach_reason = f"CO > 35 ppm: {value}"
+        elif sensor == "mq4" and metric == "ch4_ppm" and value > 5000.0:
+            hard_limit_breached = True; breach_reason = f"Methane > 5000 ppm (10% LEL): {value}"
         # Edge node health (sysmon_driver.py on every node)
         elif sensor == "sysmon" and metric == "undervolt" and value >= 1:
             hard_limit_breached = True; breach_reason = "Edge node under-voltage (power supply too weak)"

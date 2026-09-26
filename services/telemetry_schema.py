@@ -31,6 +31,8 @@ class SensorType(str, Enum):
     sysmon = "sysmon"          # node health on every edge node (Raspberry Pi 4/5)
     jetson = "jetson"          # Jetson on-board CPU/GPU temperature and power (optional hardware)
     bms = "bms"                # battery management / solar input
+    bno055 = "bno055"          # 9-axis IMU on the ESP32 sensor board (orientation, motion)
+    mq4 = "mq4"                # methane (CH₄) on the ESP32 sensor board
     eva_biosensor = "eva_biosensor"  # EVA suit vitals (habitat/eva/biosensors/<crew>)
 
 
@@ -72,6 +74,14 @@ class TelemetryPayload(BaseModel):
     solar_w: Optional[float] = None
     skin_temp_c: Optional[float] = None
     ecg_mv: Optional[float] = None
+    heading_deg: Optional[float] = Field(None, ge=0, le=360)
+    roll_deg: Optional[float] = Field(None, ge=-180, le=180)
+    pitch_deg: Optional[float] = Field(None, ge=-180, le=180)
+    lin_acc_ms2: Optional[float] = Field(None, ge=0)
+    imu_calib: Optional[int] = Field(None, ge=0, le=3)        # BNO055 system calibration
+    vout_mv: Optional[float] = Field(None, ge=0, le=5500)     # MQ-4 load voltage
+    rs_r0: Optional[float] = Field(None, ge=0)
+    ch4_ppm: Optional[float] = Field(None, ge=0)
 
     @validator("timestamp")
     def timestamp_reasonable(cls, v):
@@ -95,6 +105,8 @@ SENSOR_METRICS: Dict[str, List[str]] = {
     "jetson": ["cpu_temp", "gpu_temp", "power_w"],
     "bms": ["battery_pct", "solar_w"],
     "eva_biosensor": ["hr_bpm", "spo2_pct", "skin_temp_c"],
+    "bno055": ["heading_deg", "roll_deg", "pitch_deg", "lin_acc_ms2", "imu_calib"],
+    "mq4": ["ch4_ppm", "rs_r0", "vout_mv"],
 }
 
 # (sensor, metric) → (dashboard measurement, unit). The first sensor listed for a
@@ -123,9 +135,10 @@ DASHBOARD_MEASUREMENTS: Dict[Tuple[str, str], Tuple[str, str]] = {
     ("jetson", "power_w"): ("power_draw", "watts"),
     ("bms", "battery_pct"): ("battery_level", "percent"),
     ("bms", "solar_w"): ("solar_input", "watts"),
+    ("mq4", "ch4_ppm"): ("methane", "ppm"),
 }
 
-SENSOR_PRIORITY = ["bme280", "o2", "scd40", "mq7", "tsl2561", "sysmon", "jetson", "bms"]
+SENSOR_PRIORITY = ["bme280", "o2", "scd40", "mq7", "mq4", "tsl2561", "sysmon", "jetson", "bms"]
 
 
 class InvalidTelemetry(ValueError):
