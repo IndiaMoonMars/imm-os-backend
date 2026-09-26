@@ -36,7 +36,7 @@ class SensorType(str, Enum):
 
 class TelemetryPayload(BaseModel):
     sensor: SensorType
-    timestamp: int = Field(..., gt=0)
+    timestamp: float = Field(..., gt=0)   # Unix seconds; fractions kept (ECG runs at 100 Hz)
     sig: Optional[str] = None
     # provenance
     node_id: Optional[str] = Field(None, max_length=64)
@@ -223,5 +223,7 @@ def normalise(message: dict, topic: Optional[str] = None) -> dict:
         raise InvalidTelemetry(f"no {payload.sensor.value} metrics in payload")
     out = payload.dict(exclude_none=True)
     out["sensor"] = payload.sensor.value
+    ts = round(payload.timestamp, 3)
+    out["timestamp"] = int(ts) if ts.is_integer() else ts
     out.setdefault("zone", "unknown")
     return out

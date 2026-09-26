@@ -79,6 +79,26 @@ async def get_latest():
         return _mock_latest()
 
 
+@router.get("/sensors")
+async def get_sensors(minutes: int = Query(10, ge=1, le=1440)):
+    """Latest reading of every sensor on every node (all metrics, not just the dashboard's).
+
+    One entry per node / sensor / zone, newest first by node. The mission console's
+    Sensors view loads this once, then follows the realtime WebSocket.
+    """
+    query = f"""
+    from(bucket: "{PIPELINE_BUCKET}")
+      |> range(start: -{minutes}m)
+      |> filter(fn: (r) => r["_field"] == "value")
+      |> last()
+    """
+    try:
+        with _get_client() as client:
+            return {"sensors": sensor_snapshot(_records(client.query_api().query(query)))}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"InfluxDB unavailable: {exc}")
+
+
 @router.get("/{node_id}/latest")
 async def get_node_latest(node_id: str):
     """Return the most recent readings for a single node."""
@@ -154,6 +174,25 @@ def merge_pipeline_records(records: list) -> dict:
             "simulated": _as_bool(r.get("simulated")), "sensor": sensor, "zone": r.get("zone"),
         }
     return out
+
+
+def sensor_snapshot(records: list) -> list:
+    """Latest pipeline points → one entry per (node, sensor, zone) with all its metrics."""
+    groups: dict = {}
+    for r in records:
+        key = (r.get("node_id") or "unknown", r.get("_measurement"), r.get("zone") or "unknown")
+        g = groups.setdefault(key, {"node_id": key[0], "sensor": key[1], "zone": key[2],
+                                    "simulated": _as_bool(r.get("simulated")), "timestamp": None,
+                                    "crew_id": r.get("crew_id") if r.get("crew_id") not in (None, "-") else None,
+                                    "metrics": {}})
+        metric = r.get("metric")
+        if metric:
+            g["metrics"][metric] = r["value"]
+        ts = r.get("timestamp")
+        if ts and (g["timestamp"] is None or ts > g["timestamp"]):
+            g["timestamp"] = ts
+            g["simulated"] = _as_bool(r.get("simulated"))
+    return sorted(groups.values(), key=lambda g: (g["node_id"], g["sensor"], g["zone"]))
 
 
 def _records(tables) -> list:

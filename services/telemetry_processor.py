@@ -21,7 +21,7 @@ import asyncpg
 from confluent_kafka import Consumer, KafkaError
 from datetime import datetime, timezone, timedelta
 from influxdb_client import InfluxDBClient, Point, WritePrecision
-from influxdb_client.client.write_api import SYNCHRONOUS
+from influxdb_client.client.write_api import WriteOptions
 
 from time_service.math_engine import calculate_all
 
@@ -44,10 +44,14 @@ INFLUX_ALERTS_BUCKET = "habitat_alerts"
 
 ZSCORE_WINDOW      = 60   # samples per rolling window
 ZSCORE_THRESHOLD   = 3.0  # standard deviations for anomaly
+# Waveforms: every heartbeat's R-peak is a >3σ "anomaly"; hard limits still apply.
+NO_ZSCORE_SENSORS  = {"ecg_ad8232"}
 
 # ── InfluxDB client ─────────────────────────────────────────────────
 influx   = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
-write_api = influx.write_api(write_options=SYNCHRONOUS)
+# Batched writes: the ECG alone is ~100 points/s. Realtime views read the WebSocket
+# (telemetry-ingest), so up to 1 s of write latency only affects history queries.
+write_api = influx.write_api(write_options=WriteOptions(batch_size=500, flush_interval=1000, jitter_interval=0))
 
 # ── Z-score state ───────────────────────────────────────────────────
 # Key: (sensor, metric) → deque of recent values
@@ -81,14 +85,14 @@ def ensure_buckets():
             log.info("Created InfluxDB bucket %s (%d-day retention)", name, days)
 
 # ── Processor ───────────────────────────────────────────────────────
-def normalise_timestamp(ts: int | float) -> int:
-    """Clamp sensor timestamp to ±30s from server UTC (IEEE 1588-style correction)."""
-    now = int(time.time())
-    drift = ts - now
+def normalise_timestamp(ts: int | float) -> float:
+    """Clamp sensor timestamp to ±30s from server UTC; keeps milliseconds (ECG is 100 Hz)."""
+    now = time.time()
+    drift = float(ts) - now
     if abs(drift) > 30:
         log.debug("Timestamp drift %.1fs corrected", drift)
-        return now
-    return int(ts)
+        return round(now, 3)
+    return round(float(ts), 3)
 
 def process_message(raw: bytes):
     try:
@@ -120,7 +124,7 @@ def process_message(raw: bytes):
             continue
 
         key = (sensor, metric)
-        z   = zscore(key, float(value))
+        z   = None if sensor in NO_ZSCORE_SENSORS else zscore(key, float(value))
 
         point = (
             Point(sensor)
@@ -133,7 +137,7 @@ def process_message(raw: bytes):
             .tag("sol", sol_str)
             .tag("ist_date", ist_date)
             .field("value", float(value))
-            .time(ts, WritePrecision.S)
+            .time(int(ts * 1000), WritePrecision.MS)
         )
 
         # Write to normal bucket
@@ -149,7 +153,7 @@ def process_message(raw: bytes):
                 .tag("zone", zone)
                 .field("value", float(value))
                 .field("zscore", z)
-                .time(ts, WritePrecision.S)
+                .time(int(ts * 1000), WritePrecision.MS)
             )
             write_api.write(bucket=INFLUX_ALERTS_BUCKET, record=alert_point)
             
@@ -230,6 +234,7 @@ def main():
     def _shutdown(sig, frame):
         log.info("Shutting down processor...")
         consumer.close()
+        write_api.close()   # flush the pending batch
         influx.close()
         sys.exit(0)
 

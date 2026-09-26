@@ -229,3 +229,48 @@ def test_merge_maps_compute_node_health():
     assert out["node-compute"]["power_draw"] == {**out["node-compute"]["power_draw"], "value": 6.9, "unit": "watts"}
     assert out["node-compute"]["cpu_temp"]["value"] == 52.0
     assert out["node-rpi-02"]["undervoltage"]["value"] == 1
+
+
+# ── realtime / high-rate data ──────────────────────────────────────
+
+def test_subsecond_timestamps_survive_validation():
+    """ECG at 100 Hz: samples in the same second must keep distinct timestamps."""
+    t = NOW + 0.01
+    out = normalise({"sensor": "ecg_ad8232", "voltage": 1.62, "timestamp": t}, "habitat/sensors/ecg_ad8232/zone_a")
+    assert out["timestamp"] == round(t, 3) and out["timestamp"] != int(t)
+    assert isinstance(normalise(bme(), "habitat/sensors/bme280/zone_a")["timestamp"], int)
+
+
+def test_processor_keeps_milliseconds_and_skips_ecg_zscore(monkeypatch):
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent / "services"))   # as in its container
+    from services import telemetry_processor as tp
+    written = []
+    monkeypatch.setattr(tp.write_api, "write", lambda bucket, record: written.append((bucket, record)))
+    base = float(int(time.time()))
+    for i in range(40):   # spiky waveform: would trip a 3-sigma detector
+        v = 3.0 if i % 10 == 0 else 1.5
+        tp.process_message(json.dumps({"sensor": "ecg_ad8232", "voltage": v, "timestamp": base + i * 0.01,
+                                        "zone": "zone_a", "node_id": "node-rpi-01"}).encode())
+    lines = [rec.to_line_protocol() for bucket, rec in written]
+    assert all(b == "habitat_sensors" for b, _ in written) and len(lines) == 40
+    stamps = {l.rsplit(" ", 1)[1] for l in lines}
+    assert len(stamps) == 40                                   # no two samples collapse onto one point
+
+
+def test_sensor_snapshot_groups_every_metric():
+    from services.telemetry_api import sensor_snapshot
+    recs = [
+        {"_measurement": "ina219", "metric": "voltage_v", "value": 12.1, "node_id": "node-rpi-01", "zone": "zone_a",
+         "simulated": "false", "timestamp": "2026-09-26T10:00:01+00:00"},
+        {"_measurement": "ina219", "metric": "current_ma", "value": 850, "node_id": "node-rpi-01", "zone": "zone_a",
+         "simulated": "false", "timestamp": "2026-09-26T10:00:02+00:00"},
+        {"_measurement": "sysmon", "metric": "cpu_temp", "value": 51, "node_id": "node-compute", "zone": "compute",
+         "simulated": "true", "timestamp": "2026-09-26T10:00:00+00:00", "crew_id": "-"},
+    ]
+    snap = sensor_snapshot(recs)
+    ina = next(s for s in snap if s["sensor"] == "ina219")
+    assert ina["metrics"] == {"voltage_v": 12.1, "current_ma": 850} and ina["simulated"] is False
+    assert ina["timestamp"] == "2026-09-26T10:00:02+00:00"
+    assert next(s for s in snap if s["sensor"] == "sysmon")["crew_id"] is None
