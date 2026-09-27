@@ -46,6 +46,7 @@ ZSCORE_WINDOW      = 60   # samples per rolling window
 ZSCORE_THRESHOLD   = 3.0  # standard deviations for anomaly
 # Waveforms: every heartbeat's R-peak is a >3σ "anomaly"; hard limits still apply.
 NO_ZSCORE_SENSORS  = {"ecg_ad8232", "bno055"}   # waveform / orientation: large swings are normal
+NO_ZSCORE_METRICS  = {"warming", "calibrated"}  # 0/1 state flags: a change is news, not an anomaly
 
 # ── InfluxDB client ─────────────────────────────────────────────────
 influx   = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
@@ -124,7 +125,7 @@ def process_message(raw: bytes):
             continue
 
         key = (sensor, metric)
-        z   = None if sensor in NO_ZSCORE_SENSORS else zscore(key, float(value))
+        z   = None if sensor in NO_ZSCORE_SENSORS or metric in NO_ZSCORE_METRICS else zscore(key, float(value))
 
         point = (
             Point(sensor)

@@ -288,6 +288,47 @@ def test_bno055_and_mq4_readings_validate():
     assert "ch4_ppm" not in normalise({"sensor": "mq4", "vout_mv": 930.0, "timestamp": NOW}, "habitat/sensors/mq4/zone_a")
 
 
+def test_every_esp32_board_value_validates_and_is_stored():
+    """Everything the board sends (firmware 2): IMU physics, per-part calibration, MQ-4 state, dew points."""
+    from services.telemetry_schema import SENSOR_METRICS
+    imu = {"sensor": "bno055", "heading_deg": 182.3, "roll_deg": -5.0, "pitch_deg": 2.0, "lin_acc_ms2": 0.04,
+           "imu_calib": 3, "grav_ms2": 9.81, "mag_ut": 42.1, "gyro_dps": 0.12, "temp": 26.0,
+           "calib_gyro": 3, "calib_acc": 2, "calib_mag": 1, "timestamp": NOW}
+    gas = {"sensor": "mq4", "vout_mv": 930.0, "rs_rl": 4.376, "rs_r0": 4.4, "ch4_ppm": 16.5, "warming": 0,
+           "calibrated": 1, "timestamp": NOW}
+    bme = {"sensor": "bme280", "temp": 24.0, "hum": 46.6, "pres": 1007.8, "dew_point_c": 11.8, "timestamp": NOW}
+    scd = {"sensor": "scd40", "co2_ppm": 543.0, "temp": 25.9, "hum": 41.0, "dew_point_c": 11.8, "timestamp": NOW}
+    for p in (imu, gas, bme, scd):
+        out = normalise(p, f"habitat/sensors/{p['sensor']}/zone_a")
+        fields = set(p) - {"sensor", "timestamp"}
+        assert {k: out[k] for k in fields} == {k: p[k] for k in fields}
+        assert fields <= set(SENSOR_METRICS[p["sensor"]])        # the processor writes every one of them
+
+
+@pytest.mark.parametrize("sensor,bad", [("bno055", {"calib_mag": 4}), ("bno055", {"grav_ms2": -1}),
+                                        ("mq4", {"warming": 2}), ("mq4", {"rs_rl": -0.5})])
+def test_new_board_values_out_of_range_are_rejected(sensor, bad):
+    with pytest.raises(InvalidTelemetry):
+        normalise({"sensor": sensor, "timestamp": NOW, **({"heading_deg": 1.0} if sensor == "bno055" else
+                                                          {"vout_mv": 900.0}), **bad},
+                  f"habitat/sensors/{sensor}/zone_a")
+
+
+def test_mq4_state_flags_are_not_anomalies_but_its_signal_is(monkeypatch):
+    from services import telemetry_processor as tp
+    written = []
+    monkeypatch.setattr(tp.write_api, "write", lambda bucket, record: written.append((bucket, record)))
+    base = float(int(time.time()))
+    for i in range(31):   # warm-up ends: warming 1 → 0 after 30 steady readings
+        tp.process_message(json.dumps({"sensor": "mq4", "vout_mv": 930.0 + (i % 2), "warming": 0 if i == 30 else 1,
+                                       "timestamp": base + i, "zone": "zone_f", "node_id": "n"}).encode())
+    assert not [r for b, r in written if b == "habitat_alerts"]
+    tp.process_message(json.dumps({"sensor": "mq4", "vout_mv": 2500.0, "warming": 0, "timestamp": base + 31,
+                                   "zone": "zone_f", "node_id": "n"}).encode())
+    alerts = [r for b, r in written if b == "habitat_alerts"]
+    assert len(alerts) == 1 and "metric=vout_mv" in alerts[0].to_line_protocol()
+
+
 @pytest.mark.parametrize("bad", [{"heading_deg": 400}, {"roll_deg": -200}, {"imu_calib": 4}])
 def test_bno055_out_of_range_is_rejected(bad):
     with pytest.raises(InvalidTelemetry):

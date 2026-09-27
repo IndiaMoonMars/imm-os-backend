@@ -82,6 +82,16 @@ class TelemetryPayload(BaseModel):
     vout_mv: Optional[float] = Field(None, ge=0, le=5500)     # MQ-4 load voltage
     rs_r0: Optional[float] = Field(None, ge=0)
     ch4_ppm: Optional[float] = Field(None, ge=0)
+    rs_rl: Optional[float] = Field(None, ge=0)                # MQ-4 Rs/RL (before calibration too)
+    warming: Optional[int] = Field(None, ge=0, le=1)          # MQ-4 heater still warming up
+    calibrated: Optional[int] = Field(None, ge=0, le=1)       # MQ-4 R0 stored (CAL_MQ4)
+    dew_point_c: Optional[float] = Field(None, ge=-80, le=80) # from temp + hum at the edge
+    grav_ms2: Optional[float] = Field(None, ge=0, le=160)     # BNO055 gravity vector magnitude (9.81)
+    mag_ut: Optional[float] = Field(None, ge=0, le=2600)      # BNO055 magnetic field magnitude
+    gyro_dps: Optional[float] = Field(None, ge=0, le=3600)    # BNO055 rotation rate magnitude
+    calib_gyro: Optional[int] = Field(None, ge=0, le=3)
+    calib_acc: Optional[int] = Field(None, ge=0, le=3)
+    calib_mag: Optional[int] = Field(None, ge=0, le=3)
 
     @validator("timestamp")
     def timestamp_reasonable(cls, v):
@@ -92,8 +102,8 @@ class TelemetryPayload(BaseModel):
 
 # Metric fields each sensor reports (the processor writes one point per metric).
 SENSOR_METRICS: Dict[str, List[str]] = {
-    "bme280": ["temp", "hum", "pres"],
-    "scd40": ["co2_ppm", "temp", "hum"],
+    "bme280": ["temp", "hum", "pres", "dew_point_c"],
+    "scd40": ["co2_ppm", "temp", "hum", "dew_point_c"],
     "mq7": ["co_ppm"],
     "max30100": ["hr_bpm", "spo2_pct"],
     "ecg_ad8232": ["voltage"],
@@ -105,8 +115,9 @@ SENSOR_METRICS: Dict[str, List[str]] = {
     "jetson": ["cpu_temp", "gpu_temp", "power_w"],
     "bms": ["battery_pct", "solar_w"],
     "eva_biosensor": ["hr_bpm", "spo2_pct", "skin_temp_c"],
-    "bno055": ["heading_deg", "roll_deg", "pitch_deg", "lin_acc_ms2", "imu_calib"],
-    "mq4": ["ch4_ppm", "rs_r0", "vout_mv"],
+    "bno055": ["heading_deg", "roll_deg", "pitch_deg", "lin_acc_ms2", "imu_calib",
+               "grav_ms2", "mag_ut", "gyro_dps", "temp", "calib_gyro", "calib_acc", "calib_mag"],
+    "mq4": ["ch4_ppm", "rs_r0", "vout_mv", "rs_rl", "warming", "calibrated"],
 }
 
 # (sensor, metric) → (dashboard measurement, unit). The first sensor listed for a
