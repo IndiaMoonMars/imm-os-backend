@@ -332,3 +332,21 @@ def test_methane_alarm_and_no_imu_zscore(monkeypatch):
         tp.process_message(json.dumps({"sensor": "mq4", "ch4_ppm": ppm, "timestamp": base + 50,
                                        "zone": "zone_a", "node_id": "node-rpi-01"}).encode())
     assert alarms == [("mq4", "ch4_ppm", 6200.0)]
+
+
+# ── a real sensor next to a still-running simulator stream ─────────
+
+def test_real_reading_beats_simulated_for_the_same_measurement():
+    for order in (1, -1):   # whichever comes first from InfluxDB
+        recs = [rec("o2", "o2_pct", 20.9, simulated="true"), rec("o2", "o2_pct", 18.25, simulated="false")][::order]
+        o2 = merge_pipeline_records(recs)["node-rpi-01"]["o2"]
+        assert o2["value"] == 18.25 and o2["simulated"] is False
+
+
+def test_snapshot_keeps_real_and_simulated_streams_apart():
+    from services.telemetry_api import sensor_snapshot
+    recs = [rec("bme280", "temp", 22.5, simulated="true"), rec("bme280", "temp", 24.0, simulated="false"),
+            rec("bme280", "hum", 46.6, simulated="false")]
+    snap = [s for s in sensor_snapshot(recs) if s["sensor"] == "bme280"]
+    assert [(s["simulated"], s["metrics"]) for s in snap] == [(False, {"temp": 24.0, "hum": 46.6}),
+                                                               (True, {"temp": 22.5})]

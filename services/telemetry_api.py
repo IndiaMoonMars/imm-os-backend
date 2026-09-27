@@ -154,7 +154,8 @@ def merge_pipeline_records(records: list) -> dict:
 
     Each record is a dict with the point's tags (``_measurement`` = sensor, ``metric``,
     ``node_id``, ``simulated``) plus ``value`` and ``timestamp``. When several sensors on
-    a node report the same measurement, SENSOR_PRIORITY decides which one is shown.
+    a node report the same measurement, a real reading beats a simulated one, then
+    SENSOR_PRIORITY decides which one is shown.
     """
     out: dict = {}
     rank: dict = {}
@@ -165,24 +166,30 @@ def merge_pipeline_records(records: list) -> dict:
         name, unit = mapped
         node = r.get("node_id") or "unknown"
         sensor = r["_measurement"]
-        pr = SENSOR_PRIORITY.index(sensor) if sensor in SENSOR_PRIORITY else len(SENSOR_PRIORITY)
+        sim = _as_bool(r.get("simulated"))
+        pr = (sim, SENSOR_PRIORITY.index(sensor) if sensor in SENSOR_PRIORITY else len(SENSOR_PRIORITY))
         if (node, name) in rank and rank[(node, name)] <= pr:
             continue
         rank[(node, name)] = pr
         out.setdefault(node, {})[name] = {
             "value": r["value"], "unit": unit, "timestamp": r.get("timestamp"),
-            "simulated": _as_bool(r.get("simulated")), "sensor": sensor, "zone": r.get("zone"),
+            "simulated": sim, "sensor": sensor, "zone": r.get("zone"),
         }
     return out
 
 
 def sensor_snapshot(records: list) -> list:
-    """Latest pipeline points → one entry per (node, sensor, zone) with all its metrics."""
+    """
+    Latest pipeline points → one entry per (node, sensor, zone, real/simulated) with all its
+    metrics. Real and simulated readings of the same sensor stay separate entries: while a
+    node's simulator stream is still on next to its real sensor, merging them would mix values.
+    """
     groups: dict = {}
     for r in records:
-        key = (r.get("node_id") or "unknown", r.get("_measurement"), r.get("zone") or "unknown")
+        sim = _as_bool(r.get("simulated"))
+        key = (r.get("node_id") or "unknown", r.get("_measurement"), r.get("zone") or "unknown", sim)
         g = groups.setdefault(key, {"node_id": key[0], "sensor": key[1], "zone": key[2],
-                                    "simulated": _as_bool(r.get("simulated")), "timestamp": None,
+                                    "simulated": sim, "timestamp": None,
                                     "crew_id": r.get("crew_id") if r.get("crew_id") not in (None, "-") else None,
                                     "metrics": {}})
         metric = r.get("metric")
@@ -191,8 +198,7 @@ def sensor_snapshot(records: list) -> list:
         ts = r.get("timestamp")
         if ts and (g["timestamp"] is None or ts > g["timestamp"]):
             g["timestamp"] = ts
-            g["simulated"] = _as_bool(r.get("simulated"))
-    return sorted(groups.values(), key=lambda g: (g["node_id"], g["sensor"], g["zone"]))
+    return sorted(groups.values(), key=lambda g: (g["node_id"], g["sensor"], g["zone"], g["simulated"]))
 
 
 def _records(tables) -> list:
