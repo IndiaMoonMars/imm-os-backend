@@ -51,16 +51,20 @@ FUTURE_S = 5.0
 
 # Plausible for a crewed habitat or suit (soft limits). Outside → "soft_range".
 # Hard, physically impossible values are rejected by the schema (dead letter).
+# Outside these a value is flagged soft_range (suspect). For gas sensors they are the
+# sensor's measuring range, never tighter than an alarm limit: a hazard reading must not
+# be doubted just for being high (and a range flag never lowers an alarm, see
+# RANGE_FLAGS in services/health/rules.py).
 SOFT_RANGES: Dict[Tuple[str, str], Tuple[float, float]] = {
     ("bme280", "temp"): (0.0, 50.0),
     ("bme280", "hum"): (1.0, 99.0),
     ("bme280", "pres"): (600.0, 1100.0),
-    ("scd40", "co2_ppm"): (300.0, 10000.0),
+    ("scd40", "co2_ppm"): (300.0, 40000.0),     # the SCD40's measuring range
     ("scd40", "temp"): (0.0, 60.0),
     ("scd40", "hum"): (1.0, 99.0),
-    ("o2", "o2_pct"): (15.0, 25.0),
-    ("mq7", "co_ppm"): (0.0, 1000.0),
-    ("mq4", "ch4_ppm"): (0.0, 10000.0),
+    ("o2", "o2_pct"): (0.0, 25.0),             # SEN0322 measuring range
+    ("mq7", "co_ppm"): (0.0, 2000.0),          # MQ-7 measuring range
+    ("mq4", "ch4_ppm"): (0.0, 10000.0),        # MQ-4 measuring range (above: saturated)
     ("eva_biosensor", "hr_bpm"): (30.0, 220.0),
     ("eva_biosensor", "spo2_pct"): (70.0, 100.0),
     ("eva_biosensor", "skin_temp_c"): (25.0, 42.0),

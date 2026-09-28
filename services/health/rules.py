@@ -50,6 +50,16 @@ RESET_REASONS = {1: "power-on", 3: "software", 4: "crash", 5: "interrupt watchdo
 
 CRITICAL_SOURCES = {"scd40", "o2"}
 
+# Fail-safe: a reading that is suspect only because it is outside the sensor's normal
+# or measuring range is still believed as a hazard (a CO₂ sensor pinned high means "at
+# least this much"). Only flags that make the value itself doubtful (uncalibrated,
+# warming, reset, rate, stuck, cross-check...) mark a limit alarm UNVERIFIED and cap it.
+RANGE_FLAGS = {"soft_range", "saturated"}
+
+
+def doubtful(quality: str, reasons) -> bool:
+    return quality == "suspect" and not set(reasons or ()) <= RANGE_FLAGS
+
 
 def _limit_state(value: float, rules, active_sev) -> Optional[tuple]:
     """Highest limit breached, with hysteresis for the ones already active."""
@@ -115,7 +125,7 @@ class Rules:
             if hit is None:
                 continue
             sev, direction, limit = hit
-            unverified = m.get("quality") == "suspect"
+            unverified = doubtful(m.get("quality"), m.get("quality_reasons"))
             if unverified and _rank(sev) > _rank("warning"):
                 sev = "warning"
             word = "high" if direction == "hi" else "low"
@@ -258,7 +268,7 @@ class Rules:
             c[key] = Condition(sev, "eva", snap["crew_id"], msg, details={k: snap[k] for k in (
                 "since_contact_s", "last_position", "last_vitals", "search_radius_m", "state")},
                 simulated=snap["simulated"])
-        for s, (status, _) in tracker.live(now):
+        for s, (status, reasons) in tracker.live(now):
             if s.key.sensor != "eva_biosensor" or status not in ("ok", "suspect"):
                 continue
             crew = s.key.crew
@@ -275,7 +285,7 @@ class Rules:
                     continue
                 label, unit = VITAL_LABEL[metric]
                 sev = hit[0]
-                unverified = status == "suspect"
+                unverified = doubtful(status, reasons)
                 if unverified and _rank(sev) > _rank("warning"):
                     sev = "warning"
                 c[key] = Condition(sev, "eva", crew, f"EVA {crew}: {label} {v:g} {unit} (limit {hit[2]:g})"

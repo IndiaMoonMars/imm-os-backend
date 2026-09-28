@@ -113,7 +113,7 @@ def evaluate(tracker: StreamTracker, now: float) -> List[dict]:
                 primary_ok = prio == 0 and status == "ok"
                 m.update(status="NOMINAL" if primary_ok else "DEGRADED", value=s.last.get(metric),
                          source=s.key.id(), source_sensor=s.key.sensor, simulated=s.key.simulated,
-                         quality=status, reason=None if primary_ok else (
+                         quality=status, quality_reasons=list(reasons), reason=None if primary_ok else (
                              f"using backup {s.key.sensor}" if prio else f"{s.key.sensor} is {status}: {', '.join(reasons)}"))
             out.append(m)
     return out

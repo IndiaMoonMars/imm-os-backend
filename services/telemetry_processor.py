@@ -171,7 +171,7 @@ def process_message(raw: bytes, sink: list = None):
             # overwrites the original instead of duplicating it
             .field("q", quality)
             .field("delayed", delayed == "true")
-            .time(int(ts * 1000), WritePrecision.MS)
+            .time(int(round(ts * 1000)), WritePrecision.MS)
         )
 
         # Write to normal bucket
@@ -187,7 +187,7 @@ def process_message(raw: bytes, sink: list = None):
                 .tag("zone", zone)
                 .field("value", float(value))
                 .field("zscore", z)
-                .time(int(ts * 1000), WritePrecision.MS)
+                .time(int(round(ts * 1000)), WritePrecision.MS)
             )
             _out(INFLUX_ALERTS_BUCKET, alert_point, sink)
             

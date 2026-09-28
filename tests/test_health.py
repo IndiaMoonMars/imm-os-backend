@@ -397,3 +397,22 @@ def test_forget_node_drops_its_streams_and_closes_its_alarms():
     mon.tick(t + 405)
     assert not any("vv-node-01" in a.key for a in mon.alarms.open())       # stays quiet
     assert any(k.node == "node-rpi-01" for k in mon.tracker.streams)       # other nodes untouched
+
+
+def test_a_hazard_reading_beyond_the_sensors_range_is_not_downgraded():
+    """Fail-safe: 'outside the normal range' must not cap a CO₂ emergency; real doubt still does."""
+    for qf, want_sev, want_unverified in ((["soft_range"], "emergency", False), (["uncalibrated"], "warning", True),
+                                          (["soft_range", "uncalibrated"], "warning", True)):
+        mon = HealthMonitor()
+        for i in range(12):
+            t = T0 + i
+            mon.ingest_reading({"data": reading("scd40", t=t, co2_ppm=45000.0, q="suspect", qf=qf)}, t)
+            mon.tick(t)
+        a = mon.alarms.alarms["limit.co2.node-rpi-01.zone_a"]
+        assert (a.severity, a.unverified) == (want_sev, want_unverified), qf
+
+
+def test_scd40_emergency_level_is_inside_its_soft_range():
+    from services.quality import assess
+    r = assess({"sensor": "scd40", "co2_ppm": 25000.0, "timestamp": T0}, ["co2_ppm"], now=T0)
+    assert r["q"] == "good"
