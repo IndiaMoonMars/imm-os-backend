@@ -416,3 +416,21 @@ def test_scd40_emergency_level_is_inside_its_soft_range():
     from services.quality import assess
     r = assess({"sensor": "scd40", "co2_ppm": 25000.0, "timestamp": T0}, ["co2_ppm"], now=T0)
     assert r["q"] == "good"
+
+
+def test_suit_backfill_before_live_data_is_credited_to_the_outage():
+    from services.health.eva import EvaMonitor
+    eva = EvaMonitor(warn_s=10, los_s=30, contingency_s=120)
+    frame = lambda t, **k: {"crew_id": "ev1", "sensor": "eva_biosensor", "hr_bpm": 90.0, "timestamp": t, **k}  # noqa: E731
+    for i in range(5):
+        eva.feed(frame(T0 + i), T0 + i)
+        eva.tick(T0 + i)
+    for t in range(5, 60):                                   # silence
+        eva.tick(T0 + t)
+    assert eva.crews["ev1"].state == "LOS"
+    for i in range(5, 59):                                   # the suit replays its log first ...
+        eva.feed(frame(T0 + i, delayed=True), T0 + 60)
+    eva.feed(frame(T0 + 60), T0 + 60)                        # ... then live data resumes
+    eva.tick(T0 + 60)
+    out = eva.crews["ev1"].outages[-1]
+    assert eva.crews["ev1"].state == "NOMINAL" and out["backfilled"] == 54

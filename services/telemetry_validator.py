@@ -15,6 +15,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
@@ -94,9 +95,14 @@ def main() -> None:
 
     def _shutdown(sig, frame):
         log.info("Shutting down validator...")
-        producer.flush(10)
-        consumer.close()
-        sys.exit(0)
+        # Offsets are committed after each batch, so an unfinished one is simply read again.
+        # Leaving the group politely can hang on a bad connection: never let that hold up
+        # the exit (and with it Docker's restart) for more than a few seconds.
+        producer.flush(5)
+        closer = threading.Thread(target=consumer.close, daemon=True)
+        closer.start()
+        closer.join(5)
+        os._exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)

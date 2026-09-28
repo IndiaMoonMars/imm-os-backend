@@ -63,6 +63,7 @@ class CrewTrack:
     last_data_ts: Optional[float] = None
     positions: Deque[Tuple[float, dict]] = field(default_factory=lambda: deque(maxlen=50))
     los_started: Optional[float] = None
+    backfill_pending: int = 0              # delayed readings from the current outage, before contact returned
     outages: List[dict] = field(default_factory=list)     # completed LOS periods
     simulated: bool = False
 
@@ -115,9 +116,12 @@ class EvaMonitor:
         is_pos = reading.get("mode") in ("uwb", "gps")
         if reading.get("delayed"):
             ts = reading.get("timestamp")
-            for o in t.outages:     # backfill: data from inside an outage arrived after all
-                if isinstance(ts, (int, float)) and o["from_ts"] <= ts <= o["to_ts"]:
-                    o["backfilled"] = o.get("backfilled", 0) + 1
+            if isinstance(ts, (int, float)):
+                if t.los_started is not None and ts >= t.los_started:
+                    t.backfill_pending += 1     # the suit replays its log before live data resumes
+                for o in t.outages:     # backfill: data from inside an outage arrived after all
+                    if o["from_ts"] <= ts <= o["to_ts"]:
+                        o["backfilled"] = o.get("backfilled", 0) + 1
             return events
         if not t.armed and not reading.get("simulated"):
             events += self.arm(crew, now, by="auto")
@@ -172,7 +176,9 @@ class EvaMonitor:
                     t.los_started = t.last_contact
                 if new == "NOMINAL" and t.los_started is not None:
                     outage = {"from": t.los_started, "to": t.last_contact, "duration_s": round(t.last_contact - t.los_started, 1),
-                              "worst": t.state, "from_ts": t.los_started, "to_ts": t.last_contact, "backfilled": 0}
+                              "worst": t.state, "from_ts": t.los_started, "to_ts": t.last_contact,
+                              "backfilled": t.backfill_pending}
+                    t.backfill_pending = 0
                     # data timestamps of the gap (arrival ≈ timestamp for live data)
                     t.outages.append(outage)
                     del t.outages[:-20]

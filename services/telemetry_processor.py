@@ -15,6 +15,7 @@ import time
 import logging
 import signal
 import sys
+import threading
 from collections import defaultdict, deque
 import statistics
 
@@ -247,10 +248,12 @@ def main():
 
     def _shutdown(sig, frame):
         log.info("Shutting down processor...")
-        consumer.close()
-        write_api.close()
-        influx.close()
-        sys.exit(0)
+        # Nothing is lost by stopping here: offsets are committed only after a batch is
+        # stored. Bounded, so a hung connection can't delay the exit and the restart.
+        closer = threading.Thread(target=consumer.close, daemon=True)
+        closer.start()
+        closer.join(5)
+        os._exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT,  _shutdown)
