@@ -131,6 +131,40 @@ def test_merge_ignores_metrics_without_dashboard_name():
     assert merge_pipeline_records([rec("ecg_ad8232", "voltage", 1.2)]) == {}
 
 
+def test_merge_keeps_quality_and_a_bad_reading_loses_to_a_usable_one():
+    bad = dict(rec("bme280", "temp", 85.0), q="bad")
+    ok = dict(rec("scd40", "temp", 24.0), q="suspect")
+    out = merge_pipeline_records([bad, ok])["node-rpi-01"]["temperature"]
+    assert out["value"] == 24.0 and out["q"] == "suspect"
+    assert merge_pipeline_records([bad])["node-rpi-01"]["temperature"]["q"] == "bad"   # still shown, marked
+
+
+def test_with_quality_pairs_each_value_with_its_own_q():
+    from services.telemetry_api import with_quality
+    v = dict(rec("o2", "o2_pct", 18.3), _field="value")
+    q = dict(rec("o2", "o2_pct", "suspect"), _field="q")
+    other = dict(rec("o2", "o2_pct", "bad", node="node-rpi-02"), _field="q")
+    stale = dict(rec("scd40", "co2_ppm", "bad"), _field="q", timestamp="2026-09-25T09:00:00+00:00")
+    rows = with_quality([v, q, other, dict(rec("scd40", "co2_ppm", 700), _field="value"), stale])
+    assert [(r["_measurement"], r["q"]) for r in rows] == [("o2", "suspect"), ("scd40", None)]
+    assert "_field" not in rows[0]
+
+
+def test_latest_is_503_not_mock_data_when_influx_is_down(monkeypatch):
+    import asyncio
+    from fastapi import HTTPException
+    from services import telemetry_api as ta
+    def down(*a, **k):
+        raise ConnectionError("influxdb: connection refused")
+    monkeypatch.setattr(ta, "_query_latest_from_influx", down)
+    monkeypatch.setattr(ta, "DEV_MOCK", False)
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(ta.get_latest())
+    assert e.value.status_code == 503
+    monkeypatch.setattr(ta, "DEV_MOCK", True)
+    assert asyncio.run(ta.get_latest())["_meta"]["source"] == "mock"
+
+
 # ── /history input checks (values are interpolated into Flux) ─────
 
 def test_history_rejects_unknown_names_before_querying(monkeypatch):
@@ -188,7 +222,8 @@ def test_eva_position_frames_forwarded_for_openmct():
     topic, key, value = route(b"habitat/eva/position/ev1", json.dumps(msg).encode())
     data = json.loads(value)["data"]
     assert topic == VALIDATED_TOPIC and key == b"eva_position/ev1"
-    assert data == {"crew_id": "ev1", "mode": "uwb", "x_m": 3.2, "y_m": 4.1, "z_m": 1.2, "quality": 90.0, "timestamp": NOW}
+    assert data == {"crew_id": "ev1", "mode": "uwb", "x_m": 3.2, "y_m": 4.1, "z_m": 1.2, "quality": 90.0, "timestamp": NOW,
+                    "q": "good", "qf": [], "delayed": False}
     assert "sensor" not in data   # OpenMCT's EVA tracker treats sensor-less frames as positions
     bad = dict(msg, mode="gps")   # gps mode without lat/lon
     assert route(b"habitat/eva/position/ev1", json.dumps(bad).encode())[0] == DEADLETTER_TOPIC
@@ -346,33 +381,26 @@ def test_merge_maps_methane():
     assert out["node-rpi-01"]["methane"]["value"] == 12.5 and out["node-rpi-01"]["methane"]["unit"] == "ppm"
 
 
-def test_methane_alarm_and_no_imu_zscore(monkeypatch):
+def test_no_imu_zscore_and_quality_is_stored_with_each_point(monkeypatch):
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent.parent / "services"))
     from services import telemetry_processor as tp
-    monkeypatch.setattr(tp.write_api, "write", lambda bucket, record: written.append(bucket))
-    alarms, written = [], []
-
-    class FakeConn:
-        async def execute(self, sql, *args):
-            alarms.append(args[:3])
-
-        async def close(self):
-            pass
-
-    async def connect(**kw):
-        return FakeConn()
-    monkeypatch.setattr(tp.asyncpg, "connect", connect)
+    written = []
+    monkeypatch.setattr(tp.write_api, "write", lambda bucket, record: written.append((bucket, record)))
     base = float(int(time.time()))
     for i in range(31):   # steady, then someone turns the board: a 30-sigma jump that is not an anomaly
         tp.process_message(json.dumps({"sensor": "bno055", "heading_deg": 180.0 if i == 30 else 10.0 + (i % 2) * 0.5,
                                        "timestamp": base + i, "zone": "zone_x", "node_id": "node-rpi-01"}).encode())
-    assert "habitat_alerts" not in written
-    for ppm in (800.0, 6200.0):
-        tp.process_message(json.dumps({"sensor": "mq4", "ch4_ppm": ppm, "timestamp": base + 50,
-                                       "zone": "zone_a", "node_id": "node-rpi-01"}).encode())
-    assert alarms == [("mq4", "ch4_ppm", 6200.0)]
+    assert not [b for b, _ in written if b == "habitat_alerts"]
+    written.clear()
+    tp.process_message(json.dumps({"data": {"sensor": "mq4", "ch4_ppm": 6200.0, "timestamp": base + 50, "zone": "zone_a",
+                                            "node_id": "node-rpi-01", "q": "suspect", "delayed": True}}).encode())
+    line = written[0][1].to_line_protocol()
+    tags, fields = line.split(" ")[0], line.split(" ")[1]
+    assert 'q="suspect"' in fields and "delayed=true" in fields and ",q=" not in tags   # fields, not tags
+    # limit alarms are the health monitor's now: the processor has no database writes
+    assert not hasattr(tp, "asyncpg")
 
 
 # ── a real sensor next to a still-running simulator stream ─────────

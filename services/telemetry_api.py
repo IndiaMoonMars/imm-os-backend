@@ -34,6 +34,9 @@ INFLUX_TOKEN  = os.getenv("INFLUX_TOKEN",  "imm-super-secret-token")
 INFLUX_ORG    = os.getenv("INFLUX_ORG",    "imm_org")
 INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "telemetry")                      # legacy per-node bucket
 PIPELINE_BUCKET = os.getenv("INFLUX_PIPELINE_BUCKET", "habitat_sensors")   # telemetry-processor output
+# Made-up readings when InfluxDB is down: only for frontend work without the stack. In
+# operations an outage must show as an outage (503), never as plausible numbers.
+DEV_MOCK = os.getenv("IMM_DEV_MOCK", "0") == "1"
 
 router = APIRouter(prefix="/api/telemetry", tags=["Telemetry"], dependencies=[Depends(current_user)])
 
@@ -69,14 +72,16 @@ async def list_nodes():
 async def get_latest():
     """Return the most recent reading for every measurement across all nodes.
     
-    This is the primary endpoint used by the mission dashboard.
-    Falls back to mock data if InfluxDB is unreachable (dev convenience).
+    This is the primary endpoint used by the mission dashboard. If InfluxDB is
+    unreachable it answers 503 (mock data only with IMM_DEV_MOCK=1).
     """
     try:
         return _query_latest_from_influx()
     except Exception as exc:
-        log.warning("InfluxDB unreachable, returning mock data: %s", exc)
-        return _mock_latest()
+        if DEV_MOCK:
+            log.warning("InfluxDB unreachable, returning mock data (IMM_DEV_MOCK=1): %s", exc)
+            return _mock_latest()
+        raise HTTPException(status_code=503, detail=f"InfluxDB unavailable: {exc}")
 
 
 @router.get("/sensors")
@@ -89,12 +94,12 @@ async def get_sensors(minutes: int = Query(10, ge=1, le=1440)):
     query = f"""
     from(bucket: "{PIPELINE_BUCKET}")
       |> range(start: -{minutes}m)
-      |> filter(fn: (r) => r["_field"] == "value")
+      |> filter(fn: (r) => r["_field"] == "value" or r["_field"] == "q")
       |> last()
     """
     try:
         with _get_client() as client:
-            return {"sensors": sensor_snapshot(_records(client.query_api().query(query)))}
+            return {"sensors": sensor_snapshot(with_quality(_records(client.query_api().query(query))))}
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"InfluxDB unavailable: {exc}")
 
@@ -110,10 +115,10 @@ async def get_node_latest(node_id: str):
         data = _query_latest_from_influx(node_id=node_id)
         return {"node": node, "readings": data.get("readings", {})}
     except Exception as exc:
-        log.warning("InfluxDB unreachable for %s, returning mock: %s", node_id, exc)
-        mock = _mock_latest()
-        readings = mock["readings"].get(node_id, {})
-        return {"node": node, "readings": readings}
+        if not DEV_MOCK:
+            raise HTTPException(status_code=503, detail=f"InfluxDB unavailable: {exc}")
+        log.warning("InfluxDB unreachable for %s, returning mock (IMM_DEV_MOCK=1): %s", node_id, exc)
+        return {"node": node, "readings": _mock_latest()["readings"].get(node_id, {})}
 
 
 @router.get("/{node_id}/history")
@@ -153,9 +158,10 @@ def merge_pipeline_records(records: list) -> dict:
     Turn latest pipeline points into {node_id: {measurement: reading}}.
 
     Each record is a dict with the point's tags (``_measurement`` = sensor, ``metric``,
-    ``node_id``, ``simulated``) plus ``value`` and ``timestamp``. When several sensors on
-    a node report the same measurement, a real reading beats a simulated one, then
-    SENSOR_PRIORITY decides which one is shown.
+    ``node_id``, ``simulated``) plus ``value``, ``timestamp`` and its quality ``q``. When
+    several sensors on a node report the same measurement, a real reading beats a
+    simulated one, a usable one (good/suspect) beats a bad one, then SENSOR_PRIORITY
+    decides which one is shown. The reading keeps its ``q`` so the dashboard can mark it.
     """
     out: dict = {}
     rank: dict = {}
@@ -167,13 +173,14 @@ def merge_pipeline_records(records: list) -> dict:
         node = r.get("node_id") or "unknown"
         sensor = r["_measurement"]
         sim = _as_bool(r.get("simulated"))
-        pr = (sim, SENSOR_PRIORITY.index(sensor) if sensor in SENSOR_PRIORITY else len(SENSOR_PRIORITY))
+        q = r.get("q")
+        pr = (sim, q == "bad", SENSOR_PRIORITY.index(sensor) if sensor in SENSOR_PRIORITY else len(SENSOR_PRIORITY))
         if (node, name) in rank and rank[(node, name)] <= pr:
             continue
         rank[(node, name)] = pr
         out.setdefault(node, {})[name] = {
             "value": r["value"], "unit": unit, "timestamp": r.get("timestamp"),
-            "simulated": sim, "sensor": sensor, "zone": r.get("zone"),
+            "simulated": sim, "sensor": sensor, "zone": r.get("zone"), "q": q,
         }
     return out
 
@@ -191,10 +198,12 @@ def sensor_snapshot(records: list) -> list:
         g = groups.setdefault(key, {"node_id": key[0], "sensor": key[1], "zone": key[2],
                                     "simulated": sim, "timestamp": None,
                                     "crew_id": r.get("crew_id") if r.get("crew_id") not in (None, "-") else None,
-                                    "metrics": {}})
+                                    "metrics": {}, "quality": {}})
         metric = r.get("metric")
         if metric:
             g["metrics"][metric] = r["value"]
+            if r.get("q"):
+                g["quality"][metric] = r["q"]
         ts = r.get("timestamp")
         if ts and (g["timestamp"] is None or ts > g["timestamp"]):
             g["timestamp"] = ts
@@ -205,11 +214,31 @@ def _records(tables) -> list:
     rows = []
     for table in tables:
         for record in table.records:
-            row = {k: v for k, v in record.values.items() if not k.startswith("_") or k == "_measurement"}
+            row = {k: v for k, v in record.values.items()
+                   if (not k.startswith("_") or k in ("_measurement", "_field")) and k not in ("result", "table")}
             row["value"] = record.get_value()
             row["timestamp"] = record.get_time().isoformat()
             rows.append(row)
     return rows
+
+
+def with_quality(rows: list) -> list:
+    """
+    Rows of both the ``value`` and the ``q`` field → the value rows, each with its ``q``
+    (None for points written before quality flags existed).
+    """
+    def key(r):
+        return tuple(sorted((k, str(v)) for k, v in r.items() if k not in ("value", "timestamp", "_field")))
+    q = {key(r): (r["value"], r["timestamp"]) for r in rows if r.get("_field") == "q"}
+    out = []
+    for r in rows:
+        if r.get("_field", "value") != "value":
+            continue
+        r = {k: v for k, v in r.items() if k != "_field"}
+        qv = q.get(key(r))
+        r["q"] = qv[0] if qv and qv[1] == r["timestamp"] else None   # only the q written with this value
+        out.append(r)
+    return out
 
 
 def _latest_from_pipeline(client, node_id: Optional[str] = None) -> dict:
@@ -217,11 +246,11 @@ def _latest_from_pipeline(client, node_id: Optional[str] = None) -> dict:
     query = f"""
     from(bucket: "{PIPELINE_BUCKET}")
       |> range(start: -5m)
-      |> filter(fn: (r) => r["_field"] == "value")
+      |> filter(fn: (r) => r["_field"] == "value" or r["_field"] == "q")
       {node_filter}
       |> last()
     """
-    return merge_pipeline_records(_records(client.query_api().query(query)))
+    return merge_pipeline_records(with_quality(_records(client.query_api().query(query))))
 
 
 def _latest_from_legacy(client, node_id: Optional[str] = None) -> dict:

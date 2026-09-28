@@ -18,6 +18,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
+from services import heartbeat
 from services.telemetry_schema import InvalidTelemetry, NotTelemetry, normalise
 
 ist_tz = timezone(timedelta(hours=5, minutes=30))
@@ -95,6 +96,7 @@ def main() -> None:
     counts = {VALIDATED_TOPIC: 0, DEADLETTER_TOPIC: 0}
     while True:
         msg = consumer.poll(1.0)
+        heartbeat.beat()
         if msg is None:
             continue
         if msg.error():

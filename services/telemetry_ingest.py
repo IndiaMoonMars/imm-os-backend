@@ -33,6 +33,7 @@ log = logging.getLogger(__name__)
 
 KAFKA_BOOTSTRAP   = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 VALIDATED_TOPIC   = "telemetry.validated"
+HEALTH_TOPIC      = "health.events"      # the health monitor's alarms, EVA LOS and mode changes
 INFLUX_URL        = os.getenv("INFLUX_URL", "http://localhost:8086")
 INFLUX_TOKEN      = os.getenv("INFLUX_TOKEN", "imm-super-secret-token")
 INFLUX_ORG        = os.getenv("INFLUX_ORG", "imm_org")
@@ -52,21 +53,32 @@ class CommandReq(BaseModel):
 # ── Live Broadcast WebSockets ──────────────────────────────────────
 
 class ConnectionManager:
+    """
+    Telemetry frames go to every socket. Health events (alarms, EVA LOS, mode) go only
+    to sockets opened with ?health=1, wrapped as {"channel": "health", "event": {...}},
+    so clients that only know telemetry frames never see them.
+    """
     def __init__(self):
         self.active_connections: List[WebSocket] = []
+        self.health: set = set()
 
-    def register(self, websocket: WebSocket):
+    def register(self, websocket: WebSocket, health: bool = False):
         self.active_connections.append(websocket)
+        if health:
+            self.health.add(websocket)
 
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
+        self.health.discard(websocket)
 
-    async def broadcast(self, message: str):
+    async def broadcast(self, message: str, health: bool = False):
         for connection in list(self.active_connections):
+            if health and connection not in self.health:
+                continue
             try:
                 await connection.send_text(message)
-            except WebSocketDisconnect:
+            except Exception:           # closed mid-send: drop it, keep serving the rest
                 self.disconnect(connection)
 
 manager = ConnectionManager()
@@ -79,17 +91,20 @@ def kafka_ws_consumer_loop(loop):
         "topic.metadata.refresh.interval.ms": 10000,  # topics may be created after start-up
         "auto.offset.reset": "latest",
     })
-    consumer.subscribe([VALIDATED_TOPIC])
+    consumer.subscribe([VALIDATED_TOPIC, HEALTH_TOPIC])
     log.info("WS Broadcaster attached to Kafka stream.")
-    
+
     while True:
         msg = consumer.poll(1.0)
         if msg is None: continue
         if msg.error(): continue
-        
+
         raw_val = msg.value().decode('utf-8')
-        # Push to WS loop
-        asyncio.run_coroutine_threadsafe(manager.broadcast(raw_val), loop)
+        if msg.topic() == HEALTH_TOPIC:
+            raw_val = '{"channel": "health", "event": ' + raw_val + '}'
+            asyncio.run_coroutine_threadsafe(manager.broadcast(raw_val, health=True), loop)
+        else:
+            asyncio.run_coroutine_threadsafe(manager.broadcast(raw_val), loop)
 
 @app.on_event("startup")
 async def startup_event():
@@ -249,7 +264,7 @@ async def websocket_endpoint(websocket: WebSocket):
     user = await authenticate_websocket(websocket)
     if user is None:
         return
-    manager.register(websocket)
+    manager.register(websocket, health=websocket.query_params.get("health") == "1")
     try:
         while True:
             # heartbeat or client-sent filters

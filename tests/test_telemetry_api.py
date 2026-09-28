@@ -1,5 +1,6 @@
 """
-Telemetry API tests — uses TestClient; falls back to mock data (no real InfluxDB).
+Telemetry API tests — uses TestClient, no real InfluxDB: the /latest tests turn on the
+dev mock (IMM_DEV_MOCK=1); without it an InfluxDB outage is a 503.
 """
 import pytest
 from fastapi.testclient import TestClient
@@ -38,14 +39,27 @@ def test_nodes_have_required_fields():
         assert "zone" in node
 
 
-def test_latest_returns_readings():
+@pytest.fixture
+def dev_mock(monkeypatch):
+    from services import telemetry_api
+    monkeypatch.setattr(telemetry_api, "DEV_MOCK", True)
+
+
+def test_latest_is_503_without_influx_or_dev_mock(monkeypatch):
+    from services import telemetry_api
+    monkeypatch.setattr(telemetry_api, "DEV_MOCK", False)
+    assert client.get("/api/telemetry/latest").status_code == 503
+    assert client.get("/api/telemetry/node-rpi-01/latest").status_code == 503
+
+
+def test_latest_returns_readings(dev_mock):
     response = client.get("/api/telemetry/latest")
     assert response.status_code == 200
     data = response.json()
     assert "readings" in data
 
 
-def test_latest_has_all_three_nodes():
+def test_latest_has_all_three_nodes(dev_mock):
     response = client.get("/api/telemetry/latest")
     readings = response.json()["readings"]
     assert "node-rpi-01" in readings
@@ -53,7 +67,7 @@ def test_latest_has_all_three_nodes():
     assert "node-compute" in readings
 
 
-def test_node_latest_known_node():
+def test_node_latest_known_node(dev_mock):
     response = client.get("/api/telemetry/node-rpi-01/latest")
     assert response.status_code == 200
     assert "readings" in response.json()

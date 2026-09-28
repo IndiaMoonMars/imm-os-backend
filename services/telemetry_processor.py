@@ -5,6 +5,8 @@ Consumes 'telemetry.validated' Kafka topic, applies:
   1. IEEE 1588-style timestamp normalisation (UTC correction)
   2. Z-score anomaly detection (rolling 60-sample window per sensor+metric)
   3. Dual-write: normal → InfluxDB 'habitat_sensors', anomalies → 'habitat_alerts'
+Each point keeps the reading's quality (fields q, delayed). Limit alarms are raised by
+the health monitor (services/health_monitor.py).
 """
 
 import os
@@ -15,8 +17,6 @@ import signal
 import sys
 from collections import defaultdict, deque
 import statistics
-import asyncio
-import asyncpg
 
 from confluent_kafka import Consumer, KafkaError
 from datetime import datetime, timezone, timedelta
@@ -46,7 +46,6 @@ ZSCORE_WINDOW      = 60   # samples per rolling window
 ZSCORE_THRESHOLD   = 3.0  # standard deviations for anomaly
 # Waveforms: every heartbeat's R-peak is a >3σ "anomaly"; hard limits still apply.
 NO_ZSCORE_SENSORS  = {"ecg_ad8232", "bno055"}   # waveform / orientation: large swings are normal
-NO_ZSCORE_METRICS  = {"warming", "calibrated"}  # 0/1 state flags: a change is news, not an anomaly
 
 # ── InfluxDB client ─────────────────────────────────────────────────
 influx   = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
@@ -71,7 +70,11 @@ def zscore(key: tuple, value: float) -> float | None:
     return (value - mean) / stdev
 
 # ── Metric fields per sensor (shared with the validator) ────────────
-from telemetry_schema import SENSOR_METRICS  # noqa: E402  (script runs from services/)
+from telemetry_schema import SENSOR_METRICS, STATE_METRICS  # noqa: E402  (script runs from services/)
+import heartbeat  # noqa: E402
+
+# state flags and counters: a change is news, not an anomaly
+NO_ZSCORE_METRICS = STATE_METRICS
 
 
 def ensure_buckets():
@@ -108,6 +111,8 @@ def process_message(raw: bytes):
     zone   = data.get("zone", "unknown")
     node_id = str(data.get("node_id") or "unknown")
     simulated = "true" if data.get("simulated") else "false"
+    quality = data.get("q") if data.get("q") in ("good", "suspect", "bad") else "good"
+    delayed = "true" if data.get("delayed") else "false"
     metrics = SENSOR_METRICS.get(sensor, [])
 
     time_data = calculate_all(ts)
@@ -138,6 +143,10 @@ def process_message(raw: bytes):
             .tag("sol", sol_str)
             .tag("ist_date", ist_date)
             .field("value", float(value))
+            # quality as fields, not tags: the series stays the same, so a replayed reading
+            # overwrites the original instead of duplicating it
+            .field("q", quality)
+            .field("delayed", delayed == "true")
             .time(int(ts * 1000), WritePrecision.MS)
         )
 
@@ -158,60 +167,8 @@ def process_message(raw: bytes):
             )
             write_api.write(bucket=INFLUX_ALERTS_BUCKET, record=alert_point)
             
-        # Hard Physical Thresholds Logic (habitat + EVA suit)
-        hard_limit_breached = False
-        breach_reason = ""
-        if sensor == "scd40" and metric == "co2_ppm" and value > 1000.0:
-            hard_limit_breached = True; breach_reason = "CO2 > 1000 ppm"
-        elif sensor == "bme280" and metric == "temp" and (value < 10.0 or value > 35.0):
-            hard_limit_breached = True; breach_reason = f"Habitat temp out of range: {value}°C"
-        elif sensor == "ina219" and metric == "current_ma" and value > 3000.0:
-            hard_limit_breached = True; breach_reason = "Power current spike"
-        elif sensor == "o2" and metric == "o2_pct" and (value < 19.5 or value > 23.5):
-            hard_limit_breached = True; breach_reason = f"O\u2082 out of range: {value}%"
-        elif sensor == "mq7" and metric == "co_ppm" and value > 35.0:
-            hard_limit_breached = True; breach_reason = f"CO > 35 ppm: {value}"
-        elif sensor == "mq4" and metric == "ch4_ppm" and value > 5000.0:
-            hard_limit_breached = True; breach_reason = f"Methane > 5000 ppm (10% LEL): {value}"
-        # Edge node health (sysmon_driver.py on every node)
-        elif sensor == "sysmon" and metric == "undervolt" and value >= 1:
-            hard_limit_breached = True; breach_reason = "Edge node under-voltage (power supply too weak)"
-        elif sensor == "sysmon" and metric == "cpu_temp" and value > 80.0:
-            hard_limit_breached = True; breach_reason = f"Edge node overheating: {value}°C"
-        # EVA Suit biosensor limits
-        elif sensor == "eva_biosensor" and metric == "hr_bpm" and value > 160.0:
-            hard_limit_breached = True; breach_reason = f"EVA HR critical: {value} BPM"
-        elif sensor == "eva_biosensor" and metric == "spo2_pct" and value < 94.0:
-            hard_limit_breached = True; breach_reason = f"EVA SpO\u2082 critical: {value}%"
-        elif sensor == "eva_biosensor" and metric == "skin_temp_c" and value > 38.5:
-            hard_limit_breached = True; breach_reason = f"EVA skin temp: {value}°C"
-            
-        if hard_limit_breached:
-            log.warning(f"PHYSICAL ALARM BREACHED [{breach_reason}] {sensor} {metric} -> {value}")
-            _z = z if z is not None else 0.0
-            
-            # Fire and forget async commit to standard PG tracking table
-            async def commit_pg_alert():
-                try:
-                    conn = await asyncpg.connect(
-                        user=os.getenv("POSTGRES_USER", "admin"),
-                        password=os.getenv("POSTGRES_PASSWORD", "changeme"),
-                        database=os.getenv("POSTGRES_DB", "imm_db"),
-                        host=os.getenv("POSTGRES_HOST", "postgres")
-                    )
-                    await conn.execute("""
-                        INSERT INTO alert_history (sensor_id, metric, metric_value, zscore, alert_timestamp) 
-                        VALUES ($1, $2, $3, $4, to_timestamp($5))
-                    """, sensor, metric, float(value), _z, ts)
-                    await conn.close()
-                except Exception as e:
-                    log.error(f"Postgres Alarm Commit failed: {e}")
-                    
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(commit_pg_alert())
-            except RuntimeError: # No loop, create blocking push
-                asyncio.run(commit_pg_alert())
+        # Limit alarms (with hysteresis, one alarm per condition, acknowledgement) are the
+        # health monitor's (services/health/rules.py), not one database row per reading.
 
     log.debug("Processed %s ts=%d", sensor, ts)
 
@@ -246,6 +203,7 @@ def main():
 
     while True:
         msg = consumer.poll(timeout=1.0)
+        heartbeat.beat()
         if msg is None:
             continue
         if msg.error():

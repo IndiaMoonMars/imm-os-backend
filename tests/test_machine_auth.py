@@ -180,3 +180,27 @@ def test_time_service_roles(monkeypatch):
 
 def test_auth_module_exports():
     assert auth.EDGE_DEVICE == "edge_device"
+
+
+def test_health_events_only_reach_sockets_that_asked():
+    import asyncio
+
+    class Sock:
+        def __init__(self, fail=False):
+            self.got, self.fail = [], fail
+
+        async def send_text(self, m):
+            if self.fail:
+                raise RuntimeError("closed")
+            self.got.append(m)
+
+    m = telemetry_ingest.ConnectionManager()
+    plain, health, dead = Sock(), Sock(), Sock(fail=True)
+    m.register(plain)
+    m.register(health, health=True)
+    m.register(dead, health=True)
+    asyncio.run(m.broadcast('{"data": {"sensor": "bme280"}}'))
+    asyncio.run(m.broadcast('{"channel": "health", "event": {}}', health=True))
+    assert plain.got == ['{"data": {"sensor": "bme280"}}']
+    assert health.got == ['{"data": {"sensor": "bme280"}}', '{"channel": "health", "event": {}}']
+    assert dead not in m.active_connections and dead not in m.health    # a dead socket doesn't stop the others

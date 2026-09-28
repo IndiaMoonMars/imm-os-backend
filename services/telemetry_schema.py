@@ -16,6 +16,11 @@ from typing import Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field, validator
 
+try:                                   # standalone module, like this one
+    from services.quality import assess as assess_quality
+except ImportError:                    # scripts run from services/
+    from quality import assess as assess_quality
+
 MAX_CLOCK_SKEW_S = 86400 * 7
 
 
@@ -34,6 +39,7 @@ class SensorType(str, Enum):
     bno055 = "bno055"          # 9-axis IMU on the ESP32 sensor board (orientation, motion)
     mq4 = "mq4"                # methane (CH₄) on the ESP32 sensor board
     eva_biosensor = "eva_biosensor"  # EVA suit vitals (habitat/eva/biosensors/<crew>)
+    board = "board"            # microcontroller board health (ESP32 sensor board: resets, I2C errors)
 
 
 class TelemetryPayload(BaseModel):
@@ -45,34 +51,41 @@ class TelemetryPayload(BaseModel):
     zone: Optional[str] = Field(None, max_length=64)
     crew_id: Optional[str] = Field(None, max_length=64)
     simulated: bool = False
-    # data fields
-    temp: Optional[float] = None
-    hum: Optional[float] = None
-    pres: Optional[float] = None
-    co2_ppm: Optional[float] = None
-    co_ppm: Optional[float] = None
-    hr_bpm: Optional[float] = None
-    spo2_pct: Optional[float] = None
+    # integrity and quality (services/quality.py)
+    seq: Optional[int] = Field(None, ge=0)               # per publisher run and topic: gaps = lost readings
+    run: Optional[str] = Field(None, max_length=32)      # publisher run id (changes when the driver restarts)
+    q: Optional[str] = Field(None, regex="^(good|suspect|bad)$")
+    qf: Optional[List[str]] = Field(None, max_items=16)
+    delayed: Optional[bool] = None                       # replayed / arrived late: not live
+    # data fields; hard limits are physical impossibilities (implausible values are
+    # flagged "soft_range" by services/quality.py instead of rejected)
+    temp: Optional[float] = Field(None, ge=-100, le=150)
+    hum: Optional[float] = Field(None, ge=0, le=100.5)
+    pres: Optional[float] = Field(None, ge=0, le=2000)
+    co2_ppm: Optional[float] = Field(None, ge=0, le=100000)
+    co_ppm: Optional[float] = Field(None, ge=0, le=100000)
+    hr_bpm: Optional[float] = Field(None, ge=0, le=350)
+    spo2_pct: Optional[float] = Field(None, ge=0, le=100)
     voltage: Optional[float] = None
-    lux: Optional[float] = None
+    lux: Optional[float] = Field(None, ge=0)
     voltage_v: Optional[float] = None
     current_ma: Optional[float] = None
     power_mw: Optional[float] = None
-    o2_pct: Optional[float] = None
-    cpu_temp: Optional[float] = None
+    o2_pct: Optional[float] = Field(None, ge=0, le=100)
+    cpu_temp: Optional[float] = Field(None, ge=-40, le=150)
     gpu_temp: Optional[float] = None
-    power_w: Optional[float] = None
-    cpu_load: Optional[float] = None
-    mem_pct: Optional[float] = None
-    disk_pct: Optional[float] = None
-    fan_rpm: Optional[float] = None
-    supply_v: Optional[float] = None
+    power_w: Optional[float] = Field(None, ge=0)
+    cpu_load: Optional[float] = Field(None, ge=0)
+    mem_pct: Optional[float] = Field(None, ge=0, le=100)
+    disk_pct: Optional[float] = Field(None, ge=0, le=100)
+    fan_rpm: Optional[float] = Field(None, ge=0)
+    supply_v: Optional[float] = Field(None, ge=0, le=30)
     undervolt: Optional[int] = Field(None, ge=0, le=1)
     throttled: Optional[int] = Field(None, ge=0, le=1)
     undervolt_boot: Optional[int] = Field(None, ge=0, le=1)
-    battery_pct: Optional[float] = None
-    solar_w: Optional[float] = None
-    skin_temp_c: Optional[float] = None
+    battery_pct: Optional[float] = Field(None, ge=0, le=100)
+    solar_w: Optional[float] = Field(None, ge=0)
+    skin_temp_c: Optional[float] = Field(None, ge=0, le=60)
     ecg_mv: Optional[float] = None
     heading_deg: Optional[float] = Field(None, ge=0, le=360)
     roll_deg: Optional[float] = Field(None, ge=-180, le=180)
@@ -92,6 +105,17 @@ class TelemetryPayload(BaseModel):
     calib_gyro: Optional[int] = Field(None, ge=0, le=3)
     calib_acc: Optional[int] = Field(None, ge=0, le=3)
     calib_mag: Optional[int] = Field(None, ge=0, le=3)
+    # node health (sysmon_driver.py): services and the link to the MCC
+    svc_failed: Optional[int] = Field(None, ge=0)             # IMM-OS systemd units in failed state
+    svc_restarts: Optional[int] = Field(None, ge=0)           # total automatic restarts since boot
+    mcc_link: Optional[int] = Field(None, ge=0, le=1)         # local broker's bridge to the MCC is up
+    mqtt_backlog: Optional[int] = Field(None, ge=0)           # messages queued for the MCC (store-and-forward)
+    # board health (ESP32 sensor board)
+    uptime_s: Optional[float] = Field(None, ge=0)
+    reset_reason: Optional[int] = Field(None, ge=0, le=64)    # ESP-IDF esp_reset_reason_t
+    boot_count: Optional[int] = Field(None, ge=0)
+    i2c_err: Optional[int] = Field(None, ge=0)
+    bme_resets: Optional[int] = Field(None, ge=0)
 
     @validator("timestamp")
     def timestamp_reasonable(cls, v):
@@ -109,16 +133,23 @@ SENSOR_METRICS: Dict[str, List[str]] = {
     "ecg_ad8232": ["voltage"],
     "tsl2561": ["lux"],
     "ina219": ["voltage_v", "current_ma", "power_mw"],
-    "o2": ["o2_pct"],
+    "o2": ["o2_pct", "calibrated"],
     "sysmon": ["cpu_temp", "cpu_load", "mem_pct", "disk_pct", "fan_rpm", "power_w", "supply_v",
-               "undervolt", "throttled", "undervolt_boot"],
+               "undervolt", "throttled", "undervolt_boot", "svc_failed", "svc_restarts", "mcc_link",
+               "mqtt_backlog"],
     "jetson": ["cpu_temp", "gpu_temp", "power_w"],
     "bms": ["battery_pct", "solar_w"],
     "eva_biosensor": ["hr_bpm", "spo2_pct", "skin_temp_c"],
     "bno055": ["heading_deg", "roll_deg", "pitch_deg", "lin_acc_ms2", "imu_calib",
                "grav_ms2", "mag_ut", "gyro_dps", "temp", "calib_gyro", "calib_acc", "calib_mag"],
     "mq4": ["ch4_ppm", "rs_r0", "vout_mv", "rs_rl", "warming", "calibrated"],
+    "board": ["uptime_s", "reset_reason", "boot_count", "i2c_err", "bme_resets"],
 }
+
+# Metrics that are state or counters, not measurements: no z-score, no stuck-value check
+STATE_METRICS = {"warming", "calibrated", "imu_calib", "calib_gyro", "calib_acc", "calib_mag",
+                 "undervolt", "throttled", "undervolt_boot", "svc_failed", "svc_restarts", "mcc_link",
+                 "mqtt_backlog", "uptime_s", "reset_reason", "boot_count", "i2c_err", "bme_resets"}
 
 # (sensor, metric) → (dashboard measurement, unit). The first sensor listed for a
 # measurement wins when several report it (e.g. BME280 temperature over SCD40's).
@@ -198,6 +229,11 @@ def normalise_eva_position(message: dict, crew: str) -> dict:
     if not all(k in out for k in fields):
         raise InvalidTelemetry(f"{mode} position needs {fields}")
     out.setdefault("timestamp", int(time.time()))
+    for k in ("seq", "run", "delayed"):
+        if k in message:
+            out[k] = message[k]
+    q = assess_quality({"timestamp": out["timestamp"], "delayed": message.get("delayed")}, ())
+    out["q"], out["qf"], out["delayed"] = q["q"], q["qf"], q["delayed"]
     return out
 
 
@@ -250,4 +286,5 @@ def normalise(message: dict, topic: Optional[str] = None) -> dict:
     ts = round(payload.timestamp, 3)
     out["timestamp"] = int(ts) if ts.is_integer() else ts
     out.setdefault("zone", "unknown")
+    out.update(assess_quality(out, SENSOR_METRICS[out["sensor"]]))
     return out

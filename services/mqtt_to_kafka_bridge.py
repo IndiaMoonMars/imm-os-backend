@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
 IMM-OS MQTT → Kafka Bridge
-Subscribes to habitat/sensors/# on Mosquitto and forwards every
-message verbatim to Kafka topic 'telemetry.raw'.
+Subscribes to Mosquitto and forwards every message verbatim to Kafka, keyed by
+its MQTT topic:
+  habitat/sensors/#  → telemetry.raw    sensor readings
+  habitat/eva/#      → eva.raw          EVA suit vitals and positions
+  habitat/health/#   → health.raw       edge component status (health monitor)
+Beats services/heartbeat.py while connected, so a hung bridge is restarted.
 """
 
 import os
-import json
 import logging
 import signal
 import sys
+import time
 
 import paho.mqtt.client as mqtt
 from confluent_kafka import Producer, KafkaException
@@ -27,8 +31,10 @@ MQTT_PORT   = int(os.getenv("MQTT_PORT", "1883"))
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 RAW_TOPIC      = "telemetry.raw"
 EVA_RAW_TOPIC  = "eva.raw"
+HEALTH_RAW_TOPIC = "health.raw"
 MQTT_SUBSCRIBE = "habitat/sensors/#"
 MQTT_EVA_SUB   = "habitat/eva/#"
+MQTT_HEALTH_SUB = "habitat/health/#"
 
 # ── Kafka Producer ─────────────────────────────────────────────────
 producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP,
@@ -42,7 +48,7 @@ def delivery_report(err, msg):
 def ensure_topics():
     admin = AdminClient({"bootstrap.servers": KAFKA_BOOTSTRAP})
     existing = admin.list_topics(timeout=10).topics
-    missing = [t for t in (RAW_TOPIC, EVA_RAW_TOPIC) if t not in existing]
+    missing = [t for t in (RAW_TOPIC, EVA_RAW_TOPIC, HEALTH_RAW_TOPIC) if t not in existing]
     if missing:
         for topic, fut in admin.create_topics([NewTopic(t, num_partitions=3, replication_factor=1) for t in missing]).items():
             try:
@@ -57,14 +63,20 @@ def on_connect(client, userdata, flags, rc):
         log.info("Connected to MQTT broker at %s:%d", MQTT_HOST, MQTT_PORT)
         client.subscribe(MQTT_SUBSCRIBE, qos=1)
         client.subscribe(MQTT_EVA_SUB, qos=1)
-        log.info("Subscribed to %s and %s", MQTT_SUBSCRIBE, MQTT_EVA_SUB)
+        client.subscribe(MQTT_HEALTH_SUB, qos=1)
+        log.info("Subscribed to %s, %s and %s", MQTT_SUBSCRIBE, MQTT_EVA_SUB, MQTT_HEALTH_SUB)
     else:
         log.error("MQTT connection failed, rc=%d", rc)
 
 def on_message(client, userdata, msg):
     try:
         # Route EVA streams to dedicated topic for low-latency OpenMCT tracking
-        target_topic = EVA_RAW_TOPIC if msg.topic.startswith("habitat/eva/") else RAW_TOPIC
+        if msg.topic.startswith("habitat/eva/"):
+            target_topic = EVA_RAW_TOPIC
+        elif msg.topic.startswith("habitat/health/"):
+            target_topic = HEALTH_RAW_TOPIC
+        else:
+            target_topic = RAW_TOPIC
         producer.produce(
             target_topic,
             key=msg.topic.encode(),
@@ -80,7 +92,10 @@ def on_message(client, userdata, msg):
 def main():
     ensure_topics()
 
-    client = mqtt.Client(client_id="imm-mqtt-kafka-bridge", clean_session=True)
+    # Persistent session (fixed client id, clean_session=False): while the bridge restarts,
+    # Mosquitto queues the QoS 1 messages for it (max_queued_messages in mosquitto.conf)
+    # instead of dropping them, and delivers them when it reconnects.
+    client = mqtt.Client(client_id=os.getenv("MQTT_CLIENT_ID", "imm-mqtt-kafka-bridge"), clean_session=False)
     # Broker requires auth (allow_anonymous false); user/topics in imm-os-infra mosquitto/config/acl
     if os.getenv("MQTT_USERNAME"):
         client.username_pw_set(os.getenv("MQTT_USERNAME"), os.getenv("MQTT_PASSWORD"))
@@ -88,7 +103,8 @@ def main():
         client.tls_set(ca_certs=os.getenv("MQTT_TLS_CA"))
     client.on_connect = on_connect
     client.on_message = on_message
-    client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+    client.reconnect_delay_set(min_delay=1, max_delay=30)
+    client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
 
     def _shutdown(sig, frame):
         log.info("Shutting down bridge...")
@@ -100,7 +116,13 @@ def main():
     signal.signal(signal.SIGINT, _shutdown)
 
     log.info("Bridge running — MQTT → Kafka [%s]", RAW_TOPIC)
-    client.loop_forever()
+    from services import heartbeat
+    client.loop_start()
+    while True:
+        producer.poll(0.5)
+        if client.is_connected():
+            heartbeat.beat()
+        time.sleep(0.5)
 
 if __name__ == "__main__":
     main()
