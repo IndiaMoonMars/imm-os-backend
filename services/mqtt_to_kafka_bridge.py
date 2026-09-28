@@ -20,6 +20,11 @@ from confluent_kafka import Producer, KafkaException
 from confluent_kafka.admin import AdminClient, NewTopic
 from datetime import datetime, timezone, timedelta
 
+try:
+    from services import heartbeat
+except ImportError:      # run as a script: python services/mqtt_to_kafka_bridge.py
+    import heartbeat
+
 ist_tz = timezone(timedelta(hours=5, minutes=30))
 logging.Formatter.converter = lambda *args: datetime.now(ist_tz).timetuple()
 logging.basicConfig(level=logging.INFO, format="[UTC %(created)f] [IST %(asctime)s] [bridge] %(message)s")
@@ -116,7 +121,6 @@ def main():
     signal.signal(signal.SIGINT, _shutdown)
 
     log.info("Bridge running — MQTT → Kafka [%s]", RAW_TOPIC)
-    from services import heartbeat
     client.loop_start()
     while True:
         producer.poll(0.5)

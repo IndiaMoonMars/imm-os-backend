@@ -121,3 +121,16 @@ def test_health_store_skips_a_bad_row_instead_of_blocking():
     s.enqueue("streams", [])
     asyncio.run(s.flush())
     assert not s.pending and s.pool.sql == ["INSERT telemetry_streams"]
+
+
+def test_workers_import_the_way_compose_runs_them():
+    """compose runs these as scripts (python services/x.py), not as modules."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).parent.parent
+    for script in ("services/mqtt_to_kafka_bridge.py", "services/telemetry_processor.py"):
+        code = (f"import runpy, sys; sys.argv = ['{script}']; sys.path.insert(0, '{root / 'services'}'); "
+                f"runpy.run_path('{root / script}', run_name='not_main')")
+        r = subprocess.run([sys.executable, "-c", code], cwd="/", capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, f"{script}: {r.stderr[-600:]}"
