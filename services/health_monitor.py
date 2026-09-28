@@ -284,6 +284,8 @@ def emit(events) -> None:
         if ev.get("type") == "alarm":
             store.enqueue("alarm", ev)
         elif ev.get("type") in ("eva", "component") and ev.get("event") in ("armed", "disarmed", "recovered", "state"):
+            if ev.get("type") == "component" and ev.get("id") in monitor.components:
+                store.enqueue("component", {k: v for k, v in monitor.components[ev["id"]].items() if not k.startswith("_")})
             if ev.get("type") == "eva":
                 t = monitor.eva.crews.get(ev["crew_id"])
                 if t is not None:
@@ -352,14 +354,28 @@ async def restore() -> None:
             t.last_contact = row["last_contact"].timestamp() if row.get("last_contact") else now
             t.last_position = json.loads(row.get("last_position") or "{}")
             t.last_vitals = json.loads(row.get("last_vitals") or "{}")
+        for row in await store.load_components():
+            cid = f"{row['node_id']}/{row['component']}"
+            monitor.components[cid] = {"node_id": row["node_id"], "component": row["component"], "state": row["state"],
+                                       "reason": row.get("reason") or "", "interval_s": row.get("interval_s") or 60,
+                                       "details": row.get("details") or {}, "timestamp": None, "_received": now}
         for row in await store.load_streams(REGISTRY_WINDOW_S):
             monitor.tracker.register(StreamKey(row["node_id"], row["sensor"], row["zone"], row["crew_id"] or "",
                                                row["simulated"]),
                                      row["first_seen"].timestamp(), row["last_seen"].timestamp(), row["expected_period_s"])
-        log.info("Restored %d open alarm(s), %d armed crew, %d known stream(s)", len(monitor.alarms.alarms),
-                 sum(1 for t in monitor.eva.crews.values() if t.armed), len(monitor.tracker.streams))
+        log.info("Restored %d open alarm(s), %d armed crew, %d component(s), %d known stream(s)", len(monitor.alarms.alarms),
+                 sum(1 for t in monitor.eva.crews.values() if t.armed), len(monitor.components), len(monitor.tracker.streams))
     except Exception as exc:
         log.error("Restoring state failed: %s", exc)
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    """Write what is still queued (a last acknowledgement, a closing alarm) before exiting."""
+    try:
+        await asyncio.wait_for(store.flush(), 5)
+    except Exception as exc:
+        log.warning("store flush at shutdown: %s", exc)
 
 
 @app.on_event("startup")

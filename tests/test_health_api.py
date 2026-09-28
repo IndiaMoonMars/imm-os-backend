@@ -90,3 +90,11 @@ def test_forget_node_needs_mcc_or_commander():
     assert r.status_code == 200 and r.json()["node"] == "vv-node-01"
     assert ("forget_node", "vv-node-01") in list(hm.store.pending)
     assert client.post("/api/health/nodes/bad%20node/forget").status_code == 422
+
+
+def test_component_state_changes_are_persisted(monkeypatch):
+    now = time.time()
+    hm.monitor.ingest_component({"state": "SAFE", "reason": "relays off"}, now, "habitat/health/node-rpi-01/eclss_pid")
+    hm.emit(hm.monitor.tick(now))
+    comps = [p for k, p in hm.store.pending if k == "component"]
+    assert comps and comps[-1]["state"] == "SAFE" and "_received" not in comps[-1]

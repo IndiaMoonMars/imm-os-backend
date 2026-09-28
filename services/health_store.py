@@ -72,6 +72,17 @@ CREATE TABLE IF NOT EXISTS eva_crew_status (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS component_status (
+    node_id TEXT NOT NULL,
+    component TEXT NOT NULL,
+    state TEXT NOT NULL,
+    reason TEXT,
+    interval_s DOUBLE PRECISION,
+    details JSONB,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (node_id, component)
+);
+
 CREATE TABLE IF NOT EXISTS telemetry_streams (
     stream_key TEXT PRIMARY KEY,
     node_id TEXT NOT NULL,
@@ -137,6 +148,10 @@ class HealthStore:
         rows = await self.pool.fetch("SELECT * FROM eva_crew_status WHERE armed")
         return [dict(r) for r in rows]
 
+    async def load_components(self) -> List[dict]:
+        rows = await self.pool.fetch("SELECT * FROM component_status WHERE updated_at > now() - interval '1 day'")
+        return [{**dict(r), "details": json.loads(r["details"] or "{}")} for r in rows]
+
     async def load_streams(self, since_s: float) -> List[dict]:
         rows = await self.pool.fetch(
             "SELECT * FROM telemetry_streams WHERE last_seen > now() - make_interval(secs => $1)", since_s)
@@ -195,6 +210,16 @@ class HealthStore:
 
     async def _w_forget_node(self, node: str) -> None:
         await self.pool.execute("DELETE FROM telemetry_streams WHERE node_id = $1", node)
+        await self.pool.execute("DELETE FROM component_status WHERE node_id = $1", node)
+
+    async def _w_component(self, comp: dict) -> None:
+        await self.pool.execute(
+            """INSERT INTO component_status (node_id, component, state, reason, interval_s, details, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,now())
+               ON CONFLICT (node_id, component) DO UPDATE SET state=EXCLUDED.state, reason=EXCLUDED.reason,
+                   interval_s=EXCLUDED.interval_s, details=EXCLUDED.details, updated_at=now()""",
+            comp["node_id"], comp["component"], comp["state"], comp.get("reason") or "", comp.get("interval_s"),
+            json.dumps(comp.get("details") or {}, default=str))
 
     async def _w_note(self, ev: dict) -> None:
         await self.pool.execute(

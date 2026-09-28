@@ -82,3 +82,21 @@ def test_alarm_lifecycle_history_and_restore_on_real_postgres(pg):
         assert [r["sensor"] for r in await s.load_streams(3600)] == ["bme280"]
         await s.pool.close()
     asyncio.run(run())
+
+
+def test_component_states_survive_a_restart(pg):
+    async def run():
+        s = HealthStore()
+        assert await s.connect(), s.error
+        s.enqueue("component", {"node_id": "node-rpi-01", "component": "eclss_pid", "state": "SAFE",
+                                "reason": "no fresh temperature", "interval_s": 30, "details": {"hvac": False}})
+        s.enqueue("component", {"node_id": "node-rpi-01", "component": "eclss_pid", "state": "DEGRADED",
+                                "reason": "no humidity", "interval_s": 30, "details": {}})
+        await s.flush()
+        rows = await s.load_components()
+        assert [(r["component"], r["state"], r["reason"]) for r in rows] == [("eclss_pid", "DEGRADED", "no humidity")]
+        s.enqueue("forget_node", "node-rpi-01")
+        await s.flush()
+        assert await s.load_components() == []
+        await s.pool.close()
+    asyncio.run(run())
