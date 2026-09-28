@@ -80,3 +80,13 @@ def test_events_endpoint_is_for_services_only_and_raises_an_advisory():
     assert client.post("/api/health/events", json={**body, "severity": "nonsense"}).status_code == 200
     cond, until = hm.state["notes"]["note.autoheal.imm-validator"]
     assert cond.severity == "advisory" and until > time.time()          # unknown severity → advisory
+
+
+def test_forget_node_needs_mcc_or_commander():
+    as_user(CREW)
+    assert client.post("/api/health/nodes/vv-node-01/forget").status_code == 403
+    as_user(OPERATOR)
+    r = client.post("/api/health/nodes/vv-node-01/forget")
+    assert r.status_code == 200 and r.json()["node"] == "vv-node-01"
+    assert ("forget_node", "vv-node-01") in list(hm.store.pending)
+    assert client.post("/api/health/nodes/bad%20node/forget").status_code == 422

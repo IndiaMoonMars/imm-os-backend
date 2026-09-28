@@ -379,3 +379,21 @@ def test_methane_limits_and_no_alarm_from_late_data():
                                       "ch4_ppm": 13000.0, "q": "good", "delayed": True}}, T0 + i)
         late.tick(T0 + i)
     assert not late.alarms.alarms                      # backlog from an outage: history, not a live alarm
+
+
+def test_forget_node_drops_its_streams_and_closes_its_alarms():
+    mon = HealthMonitor()
+    t = feed_series(mon, "sysmon", T0, T0 + 60, node="vv-node-01")
+    feed_series(mon, "bme280", T0, T0 + 60, node="node-rpi-01")
+    mon.ingest_component({"state": "SAFE", "reason": "test"}, T0, "habitat/health/vv-node-01/eclss_pid")
+    for i in range(0, 400, 5):            # vv-node goes silent: offline alarm
+        feed_series(mon, "bme280", t + i, t + i, node="node-rpi-01")
+        mon.tick(t + i)
+    assert any("vv-node-01" in a.key for a in mon.alarms.open())
+    events = mon.forget_node("vv-node-01", t + 400, "capcom")
+    assert {e["event"] for e in events if e["type"] == "alarm"} == {"retired"}
+    assert not any("vv-node-01" in a.key for a in mon.alarms.open())
+    assert all(k.node != "vv-node-01" for k in mon.tracker.streams) and not mon.components
+    mon.tick(t + 405)
+    assert not any("vv-node-01" in a.key for a in mon.alarms.open())       # stays quiet
+    assert any(k.node == "node-rpi-01" for k in mon.tracker.streams)       # other nodes untouched

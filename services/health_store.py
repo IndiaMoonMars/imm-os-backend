@@ -193,6 +193,9 @@ class HealthStore:
             a.db_id, a.key, kind, snap.get("severity", a.severity), snap.get("message", a.message),
             snap.get("value", a.value), ev.get("actor"), at)
 
+    async def _w_forget_node(self, node: str) -> None:
+        await self.pool.execute("DELETE FROM telemetry_streams WHERE node_id = $1", node)
+
     async def _w_note(self, ev: dict) -> None:
         await self.pool.execute(
             "INSERT INTO alarm_events (alarm_key, event, severity, message, actor, details, at) VALUES ($1,$2,$3,$4,$5,$6,$7)",

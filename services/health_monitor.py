@@ -22,6 +22,7 @@ API (behind nginx at /api/health/, Keycloak token or the internal service token)
   GET  /api/health/measurements            measurements with their sources
   GET  /api/health/eva                     crew LOS state; POST .../eva/{crew}/arm|disarm
   GET  /api/health/services                MCC service checks
+  POST /api/health/nodes/{node}/forget     decommission a node (its streams, components, alarms)
   POST /api/health/events                  internal: autoheal and others report recoveries
   GET  /health                             liveness (the monitor's own loop is ticking)
 
@@ -471,6 +472,22 @@ async def eva_disarm(crew: str, user: User = Depends(require_roles(MCC_OPERATOR,
             raise HTTPException(404, "Crew member not tracked")
         emit(monitor.eva.disarm(crew, time.time(), by=user.username))
     return {"crew": monitor.eva.crews[crew].snapshot(time.time())}
+
+
+@app.post("/api/health/nodes/{node}/forget")
+async def forget_node(node: str, user: User = Depends(require_roles(MCC_OPERATOR, COMMANDER))):
+    """Decommission a node: stop expecting its streams and close its alarms (MCC operator / commander)."""
+    node = node.strip()
+    if not node or len(node) > 64 or not all(c.isalnum() or c in "-_." for c in node):
+        raise HTTPException(422, "Invalid node id")
+    async with _lock:
+        events = monitor.forget_node(node, time.time(), user.username)
+        emit(events)
+        store.enqueue("forget_node", node)
+        store.enqueue("note", {"key": f"node.{node}", "event": "forgotten", "severity": "advisory",
+                               "message": f"Node {node} decommissioned by {user.username}", "actor": user.username,
+                               "at": time.time()})
+    return {"node": node, "alarms_closed": sum(1 for e in events if e.get("event") == "retired")}
 
 
 @app.get("/api/health/services", dependencies=[Depends(current_user)])

@@ -18,10 +18,11 @@ import sys
 from collections import defaultdict, deque
 import statistics
 
-from confluent_kafka import Consumer, KafkaError
+from confluent_kafka import Consumer, KafkaError, KafkaException
 from datetime import datetime, timezone, timedelta
 from influxdb_client import InfluxDBClient, Point, WritePrecision
-from influxdb_client.client.write_api import WriteOptions
+from influxdb_client.client.write_api import SYNCHRONOUS
+from influxdb_client.rest import ApiException
 
 from time_service.math_engine import calculate_all
 
@@ -49,9 +50,13 @@ NO_ZSCORE_SENSORS  = {"ecg_ad8232", "bno055"}   # waveform / orientation: large 
 
 # ── InfluxDB client ─────────────────────────────────────────────────
 influx   = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
-# Batched writes: the ECG alone is ~100 points/s. Realtime views read the WebSocket
-# (telemetry-ingest), so up to 1 s of write latency only affects history queries.
-write_api = influx.write_api(write_options=WriteOptions(batch_size=500, flush_interval=1000, jitter_interval=0))
+# At-least-once: the main loop takes up to BATCH_MAX messages from Kafka (the ECG alone
+# is ~100 points/s), writes their points synchronously, and commits the Kafka offsets
+# only once InfluxDB has accepted them. If InfluxDB is down the batch is retried and
+# the rest waits in Kafka, so nothing is lost; a replay after a crash rewrites the same
+# points (same series and time), which InfluxDB stores once.
+write_api = influx.write_api(write_options=SYNCHRONOUS)
+BATCH_MAX = 1000
 
 # ── Z-score state ───────────────────────────────────────────────────
 # Key: (sensor, metric) → deque of recent values
@@ -89,16 +94,35 @@ def ensure_buckets():
             log.info("Created InfluxDB bucket %s (%d-day retention)", name, days)
 
 # ── Processor ───────────────────────────────────────────────────────
+MAX_FUTURE_S = 30.0                                          # node clock ahead
+MAX_BACKFILL_S = float(os.getenv("MAX_BACKFILL_S", 7 * 86400))  # older = node clock broken
+
+
 def normalise_timestamp(ts: int | float) -> float:
-    """Clamp sensor timestamp to ±30s from server UTC; keeps milliseconds (ECG is 100 Hz)."""
+    """
+    The reading's own time, in seconds with milliseconds (ECG is 100 Hz). Past readings
+    keep their time: a node's store-and-forward backlog after an outage must land where
+    it was measured (the validator marks it delayed), and a replayed reading must hit
+    the same point to overwrite, not duplicate, it. Only a clock that is clearly wrong
+    (ahead of the server, or more than MAX_BACKFILL_S behind) is replaced by the
+    server time; the validator has flagged such readings.
+    """
     now = time.time()
     drift = float(ts) - now
-    if abs(drift) > 30:
+    if drift > MAX_FUTURE_S or drift < -MAX_BACKFILL_S:
         log.debug("Timestamp drift %.1fs corrected", drift)
         return round(now, 3)
     return round(float(ts), 3)
 
-def process_message(raw: bytes):
+def _out(bucket: str, point, sink) -> None:
+    if sink is None:
+        write_api.write(bucket=bucket, record=point)
+    else:
+        sink.append((bucket, point))
+
+
+def process_message(raw: bytes, sink: list = None):
+    """Build the InfluxDB points for one validated reading: into sink, or written now."""
     try:
         envelope = json.loads(raw)
         data = envelope.get("data", envelope)  # support bare or enveloped
@@ -151,7 +175,7 @@ def process_message(raw: bytes):
         )
 
         # Write to normal bucket
-        write_api.write(bucket=INFLUX_BUCKET, record=point)
+        _out(INFLUX_BUCKET, point, sink)
 
         # Anomaly detection (Z-score + Physical Threshold Logging)
         if z is not None and abs(z) > ZSCORE_THRESHOLD:
@@ -165,7 +189,7 @@ def process_message(raw: bytes):
                 .field("zscore", z)
                 .time(int(ts * 1000), WritePrecision.MS)
             )
-            write_api.write(bucket=INFLUX_ALERTS_BUCKET, record=alert_point)
+            _out(INFLUX_ALERTS_BUCKET, alert_point, sink)
             
         # Limit alarms (with hysteresis, one alarm per condition, acknowledgement) are the
         # health monitor's (services/health/rules.py), not one database row per reading.
@@ -173,6 +197,36 @@ def process_message(raw: bytes):
     log.debug("Processed %s ts=%d", sensor, ts)
 
 # ── Main ────────────────────────────────────────────────────────────
+def write_batch(batch: list) -> None:
+    """Write [(bucket, point)] and return once InfluxDB has them (retrying while it is down)."""
+    by_bucket: dict = {}
+    for bucket, point in batch:
+        by_bucket.setdefault(bucket, []).append(point)
+    for bucket, points in by_bucket.items():
+        delay, failures = 1.0, 0
+        while True:
+            try:
+                write_api.write(bucket=bucket, record=points)
+                if failures:
+                    log.info("InfluxDB writes resumed after %d failed attempt(s)", failures)
+                break
+            except ApiException as exc:
+                if exc.status and 400 <= exc.status < 500 and exc.status != 429:
+                    # the data itself was refused (e.g. a field type conflict): retrying can't
+                    # help, and holding the batch would stop the whole pipeline
+                    log.error("InfluxDB refused %d point(s) for %s: %s", len(points), bucket, str(exc)[:300])
+                    break
+                err = exc
+            except Exception as exc:  # connection refused, timeout: InfluxDB down or restarting
+                err = exc
+            failures += 1
+            if failures == 1 or failures % 10 == 0:
+                log.warning("InfluxDB write failed (%s); keeping %d point(s) and retrying", str(err)[:200], len(points))
+            heartbeat.beat()     # alive and waiting: an InfluxDB outage is not a reason to restart us
+            time.sleep(delay)
+            delay = min(delay * 2, 30.0)
+
+
 def main():
     for attempt in range(10):
         try:
@@ -186,7 +240,7 @@ def main():
         "group.id": KAFKA_GROUP_ID,
         "topic.metadata.refresh.interval.ms": 10000,  # topics may be created after start-up
         "auto.offset.reset": "earliest",
-        "enable.auto.commit": True,
+        "enable.auto.commit": False,                  # committed after each batch is stored
     })
     consumer.subscribe([VALIDATED_TOPIC])
     log.info("Processor subscribed to %s", VALIDATED_TOPIC)
@@ -194,7 +248,7 @@ def main():
     def _shutdown(sig, frame):
         log.info("Shutting down processor...")
         consumer.close()
-        write_api.close()   # flush the pending batch
+        write_api.close()
         influx.close()
         sys.exit(0)
 
@@ -202,15 +256,26 @@ def main():
     signal.signal(signal.SIGINT,  _shutdown)
 
     while True:
-        msg = consumer.poll(timeout=1.0)
+        msgs = consumer.consume(num_messages=BATCH_MAX, timeout=1.0)
         heartbeat.beat()
-        if msg is None:
+        if not msgs:
             continue
-        if msg.error():
-            if msg.error().code() != KafkaError._PARTITION_EOF:
-                log.error("Kafka error: %s", msg.error())
-            continue
-        process_message(msg.value())
+        batch: list = []
+        for msg in msgs:
+            if msg.error():
+                if msg.error().code() != KafkaError._PARTITION_EOF:
+                    log.error("Kafka error: %s", msg.error())
+                continue
+            try:
+                process_message(msg.value(), batch)
+            except Exception as exc:   # one malformed reading must not stop the rest
+                log.error("Skipping unprocessable message: %s", exc)
+        if batch:
+            write_batch(batch)
+        try:
+            consumer.commit(asynchronous=False)
+        except KafkaException as exc:  # nothing to commit, or a rebalance: the next batch commits
+            log.debug("commit: %s", exc)
 
 if __name__ == "__main__":
     main()

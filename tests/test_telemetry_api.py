@@ -42,11 +42,17 @@ def test_nodes_have_required_fields():
 @pytest.fixture
 def dev_mock(monkeypatch):
     from services import telemetry_api
+    def down(*a, **k):
+        raise ConnectionError("influxdb: connection refused")
+    monkeypatch.setattr(telemetry_api, "_query_latest_from_influx", down)
     monkeypatch.setattr(telemetry_api, "DEV_MOCK", True)
 
 
 def test_latest_is_503_without_influx_or_dev_mock(monkeypatch):
     from services import telemetry_api
+    def down(*a, **k):
+        raise ConnectionError("influxdb: connection refused")
+    monkeypatch.setattr(telemetry_api, "_query_latest_from_influx", down)
     monkeypatch.setattr(telemetry_api, "DEV_MOCK", False)
     assert client.get("/api/telemetry/latest").status_code == 503
     assert client.get("/api/telemetry/node-rpi-01/latest").status_code == 503

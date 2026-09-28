@@ -84,6 +84,24 @@ class HealthMonitor:
                                   "to": comp["state"], "reason": comp["reason"], "at": now})
         return comp
 
+    def forget_node(self, node: str, now: float, actor: Optional[str] = None) -> List[dict]:
+        """
+        Decommission a node (removed or replaced hardware, or the V&V test node): drop its
+        streams and components and close its alarms, so its silence stops alarming.
+        If it publishes again it simply comes back.
+        """
+        for k in [k for k in self.tracker.streams if k.node == node]:
+            del self.tracker.streams[k]
+        for cid in [c for c, comp in self.components.items() if comp.get("node_id") == node]:
+            del self.components[cid]
+
+        def mine(a) -> bool:
+            src = a.source or ""
+            return src == node or src.startswith((node + "/", node + "|")) or f".{node}." in f".{a.key}."
+        events = self.alarms.retire(mine, now, actor)
+        events.append({"type": "node", "event": "forgotten", "node_id": node, "by": actor, "at": now})
+        return events
+
     def set_services(self, services: Dict[str, dict]) -> None:
         self.services = services
 

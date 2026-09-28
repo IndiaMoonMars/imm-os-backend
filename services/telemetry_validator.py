@@ -69,18 +69,26 @@ def ensure_topics(bootstrap: str) -> None:
 
 
 def main() -> None:
-    from confluent_kafka import Consumer, KafkaError, Producer
+    from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
 
     ensure_topics(KAFKA_BOOTSTRAP)
+    # At-least-once: offsets are committed only after every validated/rejected message of
+    # the batch is confirmed by Kafka. A failed delivery exits (Docker restarts us) so the
+    # batch is read again from the last commit instead of being skipped.
     consumer = Consumer({
         "bootstrap.servers": KAFKA_BOOTSTRAP,
         "group.id": GROUP_ID,
         "auto.offset.reset": "latest",
-        "enable.auto.commit": True,
+        "enable.auto.commit": False,
         # pick up topics created after start-up within seconds, not the 5 min default
         "topic.metadata.refresh.interval.ms": 10000,
     })
-    producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP, "acks": "all", "retries": 5})
+    producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP, "acks": "all", "enable.idempotence": True})
+    failed = []
+
+    def delivered(err, msg):
+        if err is not None:
+            failed.append(err)
     consumer.subscribe([RAW_TOPIC, EVA_RAW_TOPIC])
     log.info("Validating %s + %s → %s (rejects → %s)", RAW_TOPIC, EVA_RAW_TOPIC, VALIDATED_TOPIC, DEADLETTER_TOPIC)
 
@@ -95,25 +103,35 @@ def main() -> None:
 
     counts = {VALIDATED_TOPIC: 0, DEADLETTER_TOPIC: 0}
     while True:
-        msg = consumer.poll(1.0)
+        msgs = consumer.consume(num_messages=500, timeout=1.0)
         heartbeat.beat()
-        if msg is None:
+        if not msgs:
             continue
-        if msg.error():
-            if msg.error().code() != KafkaError._PARTITION_EOF:
-                log.error("Kafka error: %s", msg.error())
-            continue
-        routed = route(msg.key(), msg.value())
-        if routed is None:
-            continue
-        out_topic, key, value = routed
-        if out_topic == DEADLETTER_TOPIC:
-            log.warning("Rejected %s: %s", msg.key(), json.loads(value)["reason"])
-        producer.produce(out_topic, key=key, value=value)
-        producer.poll(0)
-        counts[out_topic] += 1
-        if sum(counts.values()) % 500 == 0:
-            log.info("validated=%d rejected=%d", counts[VALIDATED_TOPIC], counts[DEADLETTER_TOPIC])
+        for msg in msgs:
+            if msg.error():
+                if msg.error().code() != KafkaError._PARTITION_EOF:
+                    log.error("Kafka error: %s", msg.error())
+                continue
+            routed = route(msg.key(), msg.value())
+            if routed is None:
+                continue
+            out_topic, key, value = routed
+            if out_topic == DEADLETTER_TOPIC:
+                log.warning("Rejected %s: %s", msg.key(), json.loads(value)["reason"])
+            producer.produce(out_topic, key=key, value=value, on_delivery=delivered)
+            producer.poll(0)
+            counts[out_topic] += 1
+            if sum(counts.values()) % 500 == 0:
+                log.info("validated=%d rejected=%d", counts[VALIDATED_TOPIC], counts[DEADLETTER_TOPIC])
+        while producer.flush(10) > 0:      # Kafka slow or restarting: wait, we are alive
+            heartbeat.beat()
+        if failed:
+            log.error("Kafka did not take %d message(s) (%s); restarting to re-read them", len(failed), failed[0])
+            sys.exit(1)
+        try:
+            consumer.commit(asynchronous=False)
+        except KafkaException as exc:      # nothing to commit, or a rebalance
+            log.debug("commit: %s", exc)
 
 
 if __name__ == "__main__":

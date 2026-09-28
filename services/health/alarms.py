@@ -19,6 +19,7 @@ reading. Severities: advisory < caution < warning < emergency.
 """
 import itertools
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Dict, List, Optional
 
 SEVERITIES = ("advisory", "caution", "warning", "emergency")
@@ -147,6 +148,20 @@ class AlarmManager:
             else:
                 a.state = "rtn"
                 events.append(self._event("cleared", a, now))
+        return events
+
+    def retire(self, match, now: float, actor: Optional[str] = None) -> List[dict]:
+        """Close every open alarm for which match(alarm) is true (its source was decommissioned)."""
+        events = []
+        for key, a in list(self.alarms.items()):
+            if not match(a):
+                continue
+            a.state, a.cleared_at = "closed", a.cleared_at or now
+            del self.alarms[key]
+            events.append(self._event("retired", a, now, actor=actor))
+        for key in list(self._pending):
+            if match(SimpleNamespace(key=key, source=key)):
+                del self._pending[key]
         return events
 
     def acknowledge(self, alarm: Alarm, user: str, now: float) -> List[dict]:

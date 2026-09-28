@@ -419,3 +419,33 @@ def test_snapshot_keeps_real_and_simulated_streams_apart():
     snap = [s for s in sensor_snapshot(recs) if s["sensor"] == "bme280"]
     assert [(s["simulated"], s["metrics"]) for s in snap] == [(False, {"temp": 24.0, "hum": 46.6}),
                                                                (True, {"temp": 22.5})]
+
+
+def test_processor_keeps_the_time_of_late_readings_but_not_of_a_broken_clock():
+    from services import telemetry_processor as tp
+    now = time.time()
+    assert tp.normalise_timestamp(now - 3600) == round(now - 3600, 3)        # store-and-forward backlog
+    assert abs(tp.normalise_timestamp(now + 3600) - now) < 2                  # clock ahead
+    assert abs(tp.normalise_timestamp(0) - now) < 2                           # clock never set (1970)
+
+
+def test_processor_retries_while_influx_is_down_and_skips_refused_data(monkeypatch):
+    from services import telemetry_processor as tp
+    from influxdb_client.rest import ApiException
+    calls, script = [], [ConnectionError("refused"), ConnectionError("refused"), None]
+    def write(bucket, record):
+        calls.append((bucket, len(record)))
+        err = script.pop(0) if script else None
+        if err:
+            raise err
+    monkeypatch.setattr(tp.write_api, "write", write)
+    monkeypatch.setattr(tp.time, "sleep", lambda s: None)
+    tp.write_batch([("habitat_sensors", 1), ("habitat_sensors", 2), ("habitat_alerts", 3)])
+    assert calls == [("habitat_sensors", 2)] * 3 + [("habitat_alerts", 1)]    # nothing dropped
+    calls.clear()
+    def refuse(bucket, record):
+        calls.append(bucket)
+        raise ApiException(status=422, reason="field type conflict")
+    monkeypatch.setattr(tp.write_api, "write", refuse)
+    tp.write_batch([("habitat_sensors", 1)])
+    assert calls == ["habitat_sensors"]                                        # refused once, not retried forever
