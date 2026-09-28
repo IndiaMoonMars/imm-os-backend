@@ -1,6 +1,7 @@
 """
 Health monitor persistence (Postgres): alarms, their events, EVA crew tracking and
-the stream registry. Tables: imm-os-infra postgres/init.sql (migration 002).
+the stream registry. The monitor owns these tables and creates them on connect
+(SCHEMA below, idempotent), so an existing database needs no manual migration.
 
 Writes go through one ordered queue, so an alarm's insert always lands before its
 later updates. If Postgres is down the monitor keeps working from memory and the
@@ -19,6 +20,70 @@ from services.health.streams import StreamKey
 
 log = logging.getLogger("health_store")
 MAX_PENDING = 5000
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS alarms (
+    id BIGSERIAL PRIMARY KEY,
+    alarm_key TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    category TEXT NOT NULL,
+    source TEXT,
+    message TEXT NOT NULL,
+    state TEXT NOT NULL,                 -- active | cleared | rtn | closed (+ acked flag)
+    acked BOOLEAN NOT NULL DEFAULT FALSE,
+    acked_at TIMESTAMPTZ,
+    acked_by TEXT,
+    cleared_at TIMESTAMPTZ,
+    closed_at TIMESTAMPTZ,
+    value DOUBLE PRECISION,
+    unverified BOOLEAN NOT NULL DEFAULT FALSE,
+    simulated BOOLEAN NOT NULL DEFAULT FALSE,
+    raise_count INTEGER NOT NULL DEFAULT 1,
+    details JSONB NOT NULL DEFAULT '{}',
+    raised_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- one open alarm per condition
+CREATE UNIQUE INDEX IF NOT EXISTS alarms_open_key ON alarms (alarm_key) WHERE state <> 'closed';
+CREATE INDEX IF NOT EXISTS alarms_raised_at ON alarms (raised_at DESC);
+
+CREATE TABLE IF NOT EXISTS alarm_events (
+    id BIGSERIAL PRIMARY KEY,
+    alarm_id BIGINT REFERENCES alarms(id) ON DELETE SET NULL,
+    alarm_key TEXT NOT NULL,
+    event TEXT NOT NULL,                 -- raised, escalated, cleared, acked, closed, note, ...
+    severity TEXT,
+    message TEXT,
+    value DOUBLE PRECISION,
+    actor TEXT,
+    details JSONB,
+    at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS alarm_events_at ON alarm_events (at DESC);
+
+CREATE TABLE IF NOT EXISTS eva_crew_status (
+    crew_id TEXT PRIMARY KEY,
+    armed BOOLEAN NOT NULL,
+    armed_by TEXT,
+    state TEXT NOT NULL,
+    last_contact TIMESTAMPTZ,
+    last_position JSONB,
+    last_vitals JSONB,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS telemetry_streams (
+    stream_key TEXT PRIMARY KEY,
+    node_id TEXT NOT NULL,
+    sensor TEXT NOT NULL,
+    zone TEXT NOT NULL,
+    crew_id TEXT,
+    simulated BOOLEAN NOT NULL,
+    expected_period_s DOUBLE PRECISION,
+    first_seen TIMESTAMPTZ,
+    last_seen TIMESTAMPTZ
+);
+"""
 
 
 def _ts(t: Optional[float]):
@@ -43,9 +108,16 @@ class HealthStore:
                 user=os.getenv("POSTGRES_USER", "admin"), password=os.getenv("POSTGRES_PASSWORD", "changeme"),
                 database=os.getenv("POSTGRES_DB", "imm_db"), host=os.getenv("POSTGRES_HOST", "postgres"),
                 port=int(os.getenv("POSTGRES_PORT", "5432")), min_size=1, max_size=4, timeout=5)
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+                    # several monitors starting at once must not race on CREATE
+                    await conn.execute("SELECT pg_advisory_xact_lock(7471001)")
+                    await conn.execute(SCHEMA)
             self.ok, self.error = True, None
             return True
         except Exception as exc:     # database not up yet
+            if self.pool is not None:
+                await self.pool.close()
             self.pool, self.ok, self.error = None, False, str(exc)
             return False
 
@@ -114,10 +186,12 @@ class HealthStore:
                    WHERE id=$1""",
                 a.db_id, a.severity, a.message, a.state, a.acked, _ts(a.acked_at), a.acked_by, _ts(a.cleared_at),
                 a.value, a.unverified, a.raise_count)
+        snap = ev.get("alarm") or {}        # the alarm as it was at this event (a may have moved on)
         await self.pool.execute(
             "INSERT INTO alarm_events (alarm_id, alarm_key, event, severity, message, value, actor, at) "
             "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-            a.db_id, a.key, kind, a.severity, a.message, a.value, ev.get("actor"), at)
+            a.db_id, a.key, kind, snap.get("severity", a.severity), snap.get("message", a.message),
+            snap.get("value", a.value), ev.get("actor"), at)
 
     async def _w_note(self, ev: dict) -> None:
         await self.pool.execute(
