@@ -99,6 +99,10 @@ class TelemetryPayload(BaseModel):
     ch4_ppm: Optional[float] = Field(None, ge=0)
     rs_rl: Optional[float] = Field(None, ge=0)                # MQ-4 Rs/RL (before calibration too)
     warming: Optional[int] = Field(None, ge=0, le=1)          # MQ-4 heater still warming up
+    warm_left_s: Optional[int] = Field(None, ge=0, le=86400)  # seconds of warm-up left
+    cal_restored: Optional[int] = Field(None, ge=0, le=1)     # BNO055 calibration written back from flash
+    asc: Optional[int] = Field(None, ge=0, le=1)              # SCD40 automatic self-calibration on
+    window_s: Optional[int] = Field(None, ge=0, le=3600)      # Geiger: seconds in its counting window
     calibrated: Optional[int] = Field(None, ge=0, le=1)       # MQ-4 R0 stored (CAL_MQ4)
     dew_point_c: Optional[float] = Field(None, ge=-80, le=80) # from temp + hum at the edge
     grav_ms2: Optional[float] = Field(None, ge=0, le=160)     # BNO055 gravity vector magnitude (9.81)
@@ -143,7 +147,7 @@ class TelemetryPayload(BaseModel):
 # Metric fields each sensor reports (the processor writes one point per metric).
 SENSOR_METRICS: Dict[str, List[str]] = {
     "bme280": ["temp", "hum", "pres", "dew_point_c"],
-    "scd40": ["co2_ppm", "temp", "hum", "dew_point_c"],
+    "scd40": ["co2_ppm", "temp", "hum", "dew_point_c", "asc"],
     "mq7": ["co_ppm"],
     "max30100": ["hr_bpm", "spo2_pct"],
     "ecg_ad8232": ["voltage"],
@@ -157,15 +161,15 @@ SENSOR_METRICS: Dict[str, List[str]] = {
     "bms": ["battery_pct", "solar_w"],
     "eva_biosensor": ["hr_bpm", "spo2_pct", "skin_temp_c"],
     "bno055": ["heading_deg", "roll_deg", "pitch_deg", "lin_acc_ms2", "imu_calib",
-               "grav_ms2", "mag_ut", "gyro_dps", "temp", "calib_gyro", "calib_acc", "calib_mag"],
-    "mq4": ["ch4_ppm", "rs_r0", "vout_mv", "rs_rl", "warming", "calibrated"],
+               "grav_ms2", "mag_ut", "gyro_dps", "temp", "calib_gyro", "calib_acc", "calib_mag", "cal_restored"],
+    "mq4": ["ch4_ppm", "rs_r0", "vout_mv", "rs_rl", "warming", "calibrated", "warm_left_s"],
     "board": ["uptime_s", "reset_reason", "boot_count", "i2c_err", "bme_resets", "rssi_dbm"],
-    "geiger": ["cpm", "usv_h", "counts", "warming"],
+    "geiger": ["cpm", "usv_h", "counts", "warming", "window_s"],
     "gnss": ["fix", "sats", "lat", "lon", "alt_m", "sog_kn", "cog_deg"],
 }
 
 # Metrics that are state or counters, not measurements: no z-score, no stuck-value check
-STATE_METRICS = {"warming", "calibrated", "imu_calib", "calib_gyro", "calib_acc", "calib_mag",
+STATE_METRICS = {"warming", "calibrated", "warm_left_s", "cal_restored", "asc", "window_s", "imu_calib", "calib_gyro", "calib_acc", "calib_mag",
                  "undervolt", "throttled", "undervolt_boot", "svc_failed", "svc_restarts", "mcc_link",
                  "mqtt_backlog", "uptime_s", "reset_reason", "boot_count", "i2c_err", "bme_resets",
                  "rssi_dbm", "counts", "fix", "sats", "lat", "lon", "alt_m", "sog_kn", "cog_deg"}
