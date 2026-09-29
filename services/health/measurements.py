@@ -27,6 +27,7 @@ MEASUREMENTS: Dict[str, dict] = {
     "pressure": {"critical": False, "unit": "hPa", "sources": [("bme280", "pres")]},
     "methane": {"critical": False, "unit": "ppm", "sources": [("mq4", "ch4_ppm")]},
     "co": {"critical": False, "unit": "ppm", "sources": [("mq7", "co_ppm")]},
+    "radiation": {"critical": False, "unit": "µSv/h", "sources": [("geiger", "usv_h")]},
 }
 USABLE = {"ok": 0, "suspect": 1}
 DEW_POINT_MAX_DIFF_C = 3.0

@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - scripts run from services/
 DEFAULT_PERIOD_S = {
     "bme280": 5, "scd40": 5, "o2": 5, "mq7": 150, "mq4": 5, "bno055": 5, "board": 10,
     "sysmon": 10, "bms": 10, "jetson": 10, "tsl2561": 5, "ina219": 5, "ecg_ad8232": 0.05,
-    "max30100": 1, "eva_biosensor": 1, "eva_position": 1,
+    "max30100": 1, "eva_biosensor": 1, "eva_position": 1, "geiger": 1, "gnss": 1,
 }
 # Silent when there is nothing to measure (no finger on the pulse oximeter): never stale
 INTERMITTENT = {"max30100"}
@@ -47,6 +47,7 @@ STUCK_METRICS = {
     ("bme280", "temp"), ("bme280", "hum"), ("bme280", "pres"), ("scd40", "co2_ppm"),
     ("scd40", "temp"), ("scd40", "hum"), ("o2", "o2_pct"), ("mq4", "vout_mv"), ("mq7", "co_ppm"),
     ("eva_biosensor", "hr_bpm"), ("eva_biosensor", "skin_temp_c"),
+    ("geiger", "cpm"),               # background radiation always varies: a flat count is a dead tube
 }
 # largest believable change per second
 RATE_LIMITS = {

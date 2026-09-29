@@ -40,6 +40,8 @@ class SensorType(str, Enum):
     mq4 = "mq4"                # methane (CH₄) on the ESP32 sensor board
     eva_biosensor = "eva_biosensor"  # EVA suit vitals (habitat/eva/biosensors/<crew>)
     board = "board"            # microcontroller board health (ESP32 sensor board: resets, I2C errors)
+    geiger = "geiger"          # radiation: DFRobot SEN0463 (M4011 tube) on the external board
+    gnss = "gnss"              # position / time: DFRobot TEL0157 on the external board
 
 
 class TelemetryPayload(BaseModel):
@@ -116,6 +118,20 @@ class TelemetryPayload(BaseModel):
     boot_count: Optional[int] = Field(None, ge=0)
     i2c_err: Optional[int] = Field(None, ge=0)
     bme_resets: Optional[int] = Field(None, ge=0)
+    rssi_dbm: Optional[int] = Field(None, ge=-127, le=0)      # the board's Wi-Fi signal
+    # radiation (external board)
+    cpm: Optional[float] = Field(None, ge=0, le=1_000_000)    # counts per minute (60 s window)
+    usv_h: Optional[float] = Field(None, ge=0, le=100_000)    # dose rate, µSv/h
+    counts: Optional[int] = Field(None, ge=0)                 # pulses since the board started
+    # GNSS (external board)
+    fix: Optional[int] = Field(None, ge=0, le=1)
+    sats: Optional[int] = Field(None, ge=0, le=64)
+    lat: Optional[float] = Field(None, ge=-90, le=90)
+    lon: Optional[float] = Field(None, ge=-180, le=180)
+    alt_m: Optional[float] = Field(None, ge=-1000, le=20000)
+    sog_kn: Optional[float] = Field(None, ge=0, le=1000)
+    cog_deg: Optional[float] = Field(None, ge=0, le=360)
+    gnss_utc: Optional[str] = Field(None, max_length=24)      # the receiver's UTC (to check the node clock)
 
     @validator("timestamp")
     def timestamp_reasonable(cls, v):
@@ -143,13 +159,16 @@ SENSOR_METRICS: Dict[str, List[str]] = {
     "bno055": ["heading_deg", "roll_deg", "pitch_deg", "lin_acc_ms2", "imu_calib",
                "grav_ms2", "mag_ut", "gyro_dps", "temp", "calib_gyro", "calib_acc", "calib_mag"],
     "mq4": ["ch4_ppm", "rs_r0", "vout_mv", "rs_rl", "warming", "calibrated"],
-    "board": ["uptime_s", "reset_reason", "boot_count", "i2c_err", "bme_resets"],
+    "board": ["uptime_s", "reset_reason", "boot_count", "i2c_err", "bme_resets", "rssi_dbm"],
+    "geiger": ["cpm", "usv_h", "counts", "warming"],
+    "gnss": ["fix", "sats", "lat", "lon", "alt_m", "sog_kn", "cog_deg"],
 }
 
 # Metrics that are state or counters, not measurements: no z-score, no stuck-value check
 STATE_METRICS = {"warming", "calibrated", "imu_calib", "calib_gyro", "calib_acc", "calib_mag",
                  "undervolt", "throttled", "undervolt_boot", "svc_failed", "svc_restarts", "mcc_link",
-                 "mqtt_backlog", "uptime_s", "reset_reason", "boot_count", "i2c_err", "bme_resets"}
+                 "mqtt_backlog", "uptime_s", "reset_reason", "boot_count", "i2c_err", "bme_resets",
+                 "rssi_dbm", "counts", "fix", "sats", "lat", "lon", "alt_m", "sog_kn", "cog_deg"}
 
 # (sensor, metric) → (dashboard measurement, unit). The first sensor listed for a
 # measurement wins when several report it (e.g. BME280 temperature over SCD40's).
@@ -178,6 +197,7 @@ DASHBOARD_MEASUREMENTS: Dict[Tuple[str, str], Tuple[str, str]] = {
     ("bms", "battery_pct"): ("battery_level", "percent"),
     ("bms", "solar_w"): ("solar_input", "watts"),
     ("mq4", "ch4_ppm"): ("methane", "ppm"),
+    ("geiger", "usv_h"): ("radiation", "usv_h"),
 }
 
 SENSOR_PRIORITY = ["bme280", "o2", "scd40", "mq7", "mq4", "tsl2561", "sysmon", "jetson", "bms"]

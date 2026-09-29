@@ -434,3 +434,31 @@ def test_suit_backfill_before_live_data_is_credited_to_the_outage():
     eva.tick(T0 + 60)
     out = eva.crews["ev1"].outages[-1]
     assert eva.crews["ev1"].state == "NOMINAL" and out["backfilled"] == 54
+
+
+def test_external_board_radiation_and_gnss():
+    import time
+    from services.telemetry_schema import normalise
+    now = time.time()
+    g = normalise({"sensor": "gnss", "fix": 1, "sats": 9, "lat": -33.8, "lon": 151.2, "alt_m": -3.5,
+                   "gnss_utc": "2026-09-29T08:30:01Z", "timestamp": now, "node_id": "n", "zone": "exterior"}, "habitat/sensors/gnss/exterior")
+    assert g["lat"] == -33.8 and g["gnss_utc"].endswith("Z") and g["q"] == "good"
+    w = normalise({"sensor": "geiger", "cpm": 40.0, "usv_h": 0.26, "counts": 10, "warming": 1, "timestamp": now},
+                  "habitat/sensors/geiger/exterior")
+    assert w["q"] == "suspect" and "warming" in w["qf"]                  # first minute: window not full
+    mon = HealthMonitor()
+    for i, usv in enumerate([0.1] * 5 + [3.0] * 12):
+        t = T0 + i
+        mon.ingest_reading({"data": {"sensor": "geiger", "node_id": "n", "zone": "exterior", "timestamp": t,
+                                     "cpm": usv * 153.8, "usv_h": usv, "counts": i, "warming": 0, "q": "good"}}, t)
+        mon.tick(t)
+    a = mon.alarms.alarms["limit.radiation.n.exterior"]
+    assert a.severity == "warning" and "Radiation high" in a.message
+
+
+def test_dead_geiger_tube_is_stuck():
+    tr = StreamTracker()
+    for i in range(0, 700, 1):
+        tr.feed({"sensor": "geiger", "node_id": "n", "zone": "exterior", "timestamp": T0 + i, "cpm": 0.0, "usv_h": 0.0}, T0 + i)
+    s = next(iter(tr.streams.values()))
+    assert "stuck" in s.assess(T0 + 700)[1]

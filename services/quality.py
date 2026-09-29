@@ -74,11 +74,13 @@ SOFT_RANGES: Dict[Tuple[str, str], Tuple[float, float]] = {
     ("sysmon", "supply_v"): (4.5, 5.6),
     ("bno055", "grav_ms2"): (8.8, 10.8),
     ("bno055", "mag_ut"): (5.0, 150.0),
+    ("geiger", "usv_h"): (0.0, 1000.0),        # M4011 saturates far below its hard limit
 }
 
 # Sensor-declared state fields → flags (the reading says it itself)
 _STATE_FLAGS = (
     ("mq4", "warming", 1, "warming"),
+    ("geiger", "warming", 1, "warming"),       # first minute: the CPM window is not full yet
     ("mq4", "calibrated", 0, "uncalibrated"),
     ("o2", "calibrated", 0, "uncalibrated"),
     ("bno055", "imu_calib", 0, "uncalibrated"),

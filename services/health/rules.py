@@ -31,10 +31,14 @@ LIMITS = {
     "temperature": [("caution", "lo", 10.0, 0.5), ("caution", "hi", 35.0, 0.5),
                     ("warning", "lo", 5.0, 0.5), ("warning", "hi", 40.0, 0.5)],
     "humidity": [("caution", "hi", 75.0, 3.0), ("caution", "lo", 15.0, 2.0)],
+    # dose rate, µSv/h: natural background is about 0.05-0.3; 0.5 ≈ several times background
+    # (look for a cause), 2.5 = a supervised-area design level, 25 = leave the area
+    "radiation": [("caution", "hi", 0.5, 0.05), ("warning", "hi", 2.5, 0.2), ("emergency", "hi", 25.0, 2.0)],
 }
 LABEL = {"co2": "CO₂", "o2": "O₂", "co": "CO", "methane": "Methane", "temperature": "Temperature",
-         "humidity": "Humidity", "pressure": "Pressure"}
-UNIT = {"co2": "ppm", "o2": "%", "co": "ppm", "methane": "ppm", "temperature": "°C", "humidity": "%RH"}
+         "humidity": "Humidity", "pressure": "Pressure", "radiation": "Radiation"}
+UNIT = {"co2": "ppm", "o2": "%", "co": "ppm", "methane": "ppm", "temperature": "°C", "humidity": "%RH",
+        "radiation": "µSv/h"}
 
 # EVA suit vitals (eva_biosensor per crew member)
 VITALS = {
