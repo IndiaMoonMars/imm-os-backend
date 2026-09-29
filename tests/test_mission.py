@@ -264,3 +264,13 @@ def test_flux_rows_reads_annotated_csv(monkeypatch):
                        "_value": 22.5, "metric": "temp"}
     assert rows[1]["_value"] is None
     assert api._epoch(rows[1]["_time"]) == pytest.approx(api._epoch("2026-09-27T22:48:00Z") + 0.123456789)
+
+
+def test_edge_nodes_can_read_the_mission_clock(mission_env):
+    from services.auth import authenticated
+    client.post("/api/mission/start", json={"name": "Alpha", "start_ist": "2026-09-27 02:48:16"})
+    app.dependency_overrides.clear()
+    app.dependency_overrides[authenticated] = lambda: User("service-account-imm-edge", frozenset({"edge_device"}))
+    assert client.get("/api/mission").status_code == 403                  # the full API stays crew / MCC only
+    r = client.get("/api/mission/clock").json()
+    assert r["mission"]["start"] == T0 and r["clock"]["sol"] == 3

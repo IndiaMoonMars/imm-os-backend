@@ -2,6 +2,7 @@
 IMM-OS mission record API (/api/mission, in the backend service).
 
     GET    /api/mission                    the mission and its clock (the top bar polls this)
+    GET    /api/mission/clock              the same for edge nodes (edge_device role): the Pi's SD recorder
     POST   /api/mission/start              start a mission: name, T0 (IST, default now), sols, crew
     PATCH  /api/mission                    rename, correct T0, change the number of sols
     POST   /api/mission/end                end the mission now
@@ -46,7 +47,7 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from services import mission as M
-from services.auth import COMMANDER, MCC_OPERATOR, User, authenticated, current_user, require_roles
+from services.auth import COMMANDER, MCC_OPERATOR, User, authenticated, crew_or_edge, current_user, require_roles
 from services.health.streams import DEFAULT_PERIOD_S
 from services.telemetry_api import PIPELINE_BUCKET, _get_client
 
@@ -393,6 +394,14 @@ async def get_mission():
     m = await store.current()
     return {"now": now, "mission": m.to_json() if m else None, "clock": M.clock(m, now),
             "sols": M.sol_states(m, now) if m else []}
+
+
+@downloads.get("/clock")
+async def mission_clock(user: User = Depends(crew_or_edge)):
+    """The mission and its clock for edge nodes too (the Pi's SD recorder files readings by sol)."""
+    now = time.time()
+    m = await store.current()
+    return {"now": now, "mission": m.to_json() if m else None, "clock": M.clock(m, now)}
 
 
 @router.post("/start")
