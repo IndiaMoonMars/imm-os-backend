@@ -1,10 +1,26 @@
 """
-Telemetry API tests — uses TestClient; falls back to mock data (no real InfluxDB).
+Telemetry API tests — uses TestClient, no real InfluxDB: the /latest tests turn on the
+dev mock (IMM_DEV_MOCK=1); without it an InfluxDB outage is a 503.
 """
+import pytest
 from fastapi.testclient import TestClient
 from main import app
+from services.auth import User, current_user
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def logged_in():
+    app.dependency_overrides[current_user] = lambda: User("capcom", frozenset({"mcc_operator"}))
+    yield
+    app.dependency_overrides.clear()
+
+
+def test_telemetry_requires_login():
+    app.dependency_overrides.clear()
+    assert client.get("/api/telemetry/nodes").status_code == 401
+    assert client.get("/health").status_code == 200  # liveness stays open for Docker/K3s
 
 
 def test_nodes_returns_list():
@@ -23,22 +39,41 @@ def test_nodes_have_required_fields():
         assert "zone" in node
 
 
-def test_latest_returns_readings():
+@pytest.fixture
+def dev_mock(monkeypatch):
+    from services import telemetry_api
+    def down(*a, **k):
+        raise ConnectionError("influxdb: connection refused")
+    monkeypatch.setattr(telemetry_api, "_query_latest_from_influx", down)
+    monkeypatch.setattr(telemetry_api, "DEV_MOCK", True)
+
+
+def test_latest_is_503_without_influx_or_dev_mock(monkeypatch):
+    from services import telemetry_api
+    def down(*a, **k):
+        raise ConnectionError("influxdb: connection refused")
+    monkeypatch.setattr(telemetry_api, "_query_latest_from_influx", down)
+    monkeypatch.setattr(telemetry_api, "DEV_MOCK", False)
+    assert client.get("/api/telemetry/latest").status_code == 503
+    assert client.get("/api/telemetry/node-rpi-01/latest").status_code == 503
+
+
+def test_latest_returns_readings(dev_mock):
     response = client.get("/api/telemetry/latest")
     assert response.status_code == 200
     data = response.json()
     assert "readings" in data
 
 
-def test_latest_has_all_three_nodes():
+def test_latest_has_all_three_nodes(dev_mock):
     response = client.get("/api/telemetry/latest")
     readings = response.json()["readings"]
     assert "node-rpi-01" in readings
     assert "node-rpi-02" in readings
-    assert "node-jetson" in readings
+    assert "node-compute" in readings
 
 
-def test_node_latest_known_node():
+def test_node_latest_known_node(dev_mock):
     response = client.get("/api/telemetry/node-rpi-01/latest")
     assert response.status_code == 200
     assert "readings" in response.json()

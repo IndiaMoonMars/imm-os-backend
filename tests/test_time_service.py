@@ -1,21 +1,36 @@
 import pytest
 import time
 import asyncio
+import redis.asyncio as redis
 from services.time_service.math_engine import calculate_all, get_jd_tt
 import services.time_service.delay_queue as dq
+
+
+@pytest.fixture
+async def fresh_redis(monkeypatch):
+    """
+    Per-test Redis client: the module-level dq.r binds its connection to the
+    first test's event loop, and pytest-asyncio gives each test a new loop.
+    """
+    client = redis.from_url(dq.REDIS_URL, decode_responses=True)
+    monkeypatch.setattr(dq, "r", client)
+    yield client
+    await client.aclose()
+
 
 def test_mars_sol_date_calc():
     """
     Test NASA Mars24 algorithm correctness.
-    We test against a known UTC timestamp.
-    Example: J2000.0 (Jan 1, 2000, 12:00:00 UTC) = Unix 946728000
-    NASA MSD roughly = 44796.0 
+    MSD = (JD_TT - 2451549.5) / 1.0274912517 + 44796.0 - 0.0009626, so
+    MSD ~44796.0 falls at 2000-01-06 00:00:00 UTC (Unix 947116800), not at
+    J2000.0 (2000-01-01 12:00 UTC), where MSD ~44791.62.
     """
-    unix_j2000 = 946728000.0
-    res = calculate_all(unix_j2000)
-    
-    # NASA references MSD ~44796.0 at exactly J2000 epoch
+    unix_mars24_epoch = 947116800.0
+    res = calculate_all(unix_mars24_epoch)
     assert 44795.9 < res["msd"] < 44796.1
+
+    res = calculate_all(946728000.0)  # J2000.0
+    assert 44791.5 < res["msd"] < 44791.7
 
 def test_ist_timezone():
     """
@@ -27,7 +42,7 @@ def test_ist_timezone():
     assert res["ist"] == "2000-01-01T17:30:00+05:30"
 
 @pytest.mark.asyncio
-async def test_delay_queue_hold():
+async def test_delay_queue_hold(fresh_redis):
     """
     Test that delay queue correctly holds and assigns release times.
     """
@@ -46,7 +61,7 @@ async def test_delay_queue_hold():
     assert res["delay_applied"] == 0.05
 
 @pytest.mark.asyncio
-async def test_delay_queue_pop():
+async def test_delay_queue_pop(fresh_redis):
     """
     Test queue processing worker mechanics
     """

@@ -9,6 +9,7 @@ Handles:
   - Video / Audio log management
 """
 import os
+import re
 import json
 import asyncio
 import logging
@@ -19,10 +20,15 @@ from enum import Enum
 
 import asyncpg
 import httpx
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Header
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+from services.auth import (
+    COMMANDER, CREW, FLIGHT_SURGEON, MCC_OPERATOR, User, current_user,
+    ensure_self_or_roles, require_roles, service_headers,
+)
 
 # ── Logging (IST) ─────────────────────────────────────────────────
 ist_tz = timezone(timedelta(hours=5, minutes=30))
@@ -46,6 +52,22 @@ ECLSS_SVC = os.getenv("ECLSS_API_URL", "http://eclss-api:8003")
 MEDIA_DIR = os.getenv("MEDIA_DIR", "/app/media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
+
+def media_path(prefix: str, filename: Optional[str]) -> tuple:
+    """
+    Build (safe_name, absolute path) inside MEDIA_DIR from a server-side prefix
+    and a client-supplied filename: drop any directory part (/ or \\), keep
+    [A-Za-z0-9._-], and refuse anything that resolves outside MEDIA_DIR.
+    """
+    base = re.split(r"[\\/]", filename or "")[-1]
+    clean = re.sub(r"[^A-Za-z0-9._-]", "_", base).lstrip(".")[:150] or "upload"
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", f"{prefix}_{clean}")
+    root = os.path.realpath(MEDIA_DIR)
+    path = os.path.realpath(os.path.join(root, safe))
+    if os.path.dirname(path) != root:
+        raise HTTPException(400, "Invalid file name")
+    return safe, path
+
 DELAY_MAP = {"none": 0, "moon": 1.28, "mars": 480}   # seconds (scaled for demo; real = 480 s / 8 min)
 
 async def get_conn():
@@ -57,7 +79,7 @@ async def current_delay_seconds() -> float:
     """Fetch active comm delay from time-service."""
     try:
         async with httpx.AsyncClient(timeout=2) as client:
-            r = await client.get(f"{TIME_SVC}/api/v1/time/delay")
+            r = await client.get(f"{TIME_SVC}/api/v1/time/delay", headers=service_headers())
             d = r.json()
             mode = d.get("mode", "none")
             if mode == "custom":
@@ -69,7 +91,7 @@ async def current_delay_seconds() -> float:
 async def current_mission_day() -> int:
     try:
         async with httpx.AsyncClient(timeout=2) as client:
-            r = await client.get(f"{TIME_SVC}/api/v1/time/now")
+            r = await client.get(f"{TIME_SVC}/api/v1/time/now", headers=service_headers())
             d = r.json()
             ts = float(d.get("unix_ts", time.time()))
             return max(1, int((ts - 1710000000) / 86400))
@@ -80,7 +102,7 @@ async def eclss_snapshot() -> dict:
     """Fetch latest lighting state as a proxy for ECLSS live summary."""
     try:
         async with httpx.AsyncClient(timeout=2) as client:
-            r = await client.get(f"{ECLSS_SVC}/api/v1/eclss/lighting")
+            r = await client.get(f"{ECLSS_SVC}/api/v1/eclss/lighting", headers=service_headers())
             return {"lighting": r.json(), "fetched_at": datetime.now(ist_tz).isoformat()}
     except Exception:
         return {"error": "ECLSS unavailable"}
@@ -118,12 +140,15 @@ class MessageSend(BaseModel):
     thread_id: Optional[int] = None
 
 @app.post("/api/v1/comms/message", status_code=201)
-async def send_message(msg: MessageSend):
+async def send_message(msg: MessageSend, user: User = Depends(current_user)):
     if msg.recipient_group not in ("astro", "mcc", "all"):
         raise HTTPException(422, "recipient_group must be astro, mcc, or all")
+    # Users send as themselves; internal services send as e.g. "medical-system"
+    ensure_self_or_roles(user, msg.sender_id)
 
-    # Zero delay for astro↔astro; time-service delay for astro→mcc
-    if msg.sender_id.startswith("astro") and msg.recipient_group == "mcc":
+    # Zero delay for astro↔astro; time-service delay for habitat crew → mcc
+    in_habitat = not user.is_service and user.has_any(CREW, COMMANDER)
+    if in_habitat and msg.recipient_group == "mcc":
         delay_s = await current_delay_seconds()
     else:
         delay_s = 0.0
@@ -164,7 +189,8 @@ async def send_message(msg: MessageSend):
         await conn.close()
 
 @app.get("/api/v1/comms/inbox/{user_id}")
-async def get_inbox(user_id: str, group: str = Query("all")):
+async def get_inbox(user_id: str, group: str = Query("all"), user: User = Depends(current_user)):
+    ensure_self_or_roles(user, user_id)
     conn = await get_conn()
     try:
         rows = await conn.fetch(
@@ -194,7 +220,7 @@ async def get_inbox(user_id: str, group: str = Query("all")):
     finally:
         await conn.close()
 
-@app.get("/api/v1/comms/thread/{thread_id}")
+@app.get("/api/v1/comms/thread/{thread_id}", dependencies=[Depends(current_user)])
 async def get_thread(thread_id: int):
     conn = await get_conn()
     try:
@@ -207,8 +233,9 @@ async def get_thread(thread_id: int):
         await conn.close()
 
 @app.get("/api/v1/comms/pending/{sender_id}")
-async def pending_messages(sender_id: str):
+async def pending_messages(sender_id: str, user: User = Depends(current_user)):
     """Returns outbox items not yet delivered — for countdown display."""
+    ensure_self_or_roles(user, sender_id)
     conn = await get_conn()
     try:
         rows = await conn.fetch(
@@ -236,7 +263,8 @@ class JournalCreate(BaseModel):
     tags: List[str] = []
 
 @app.post("/api/v1/journal/entry", status_code=201)
-async def create_journal(entry: JournalCreate):
+async def create_journal(entry: JournalCreate, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, entry.author_id)
     mission_day = await current_mission_day()
     conn = await get_conn()
     try:
@@ -254,7 +282,7 @@ async def create_journal(entry: JournalCreate):
         await conn.close()
 
 @app.get("/api/v1/journal/entries/{author_id}")
-async def get_journals(author_id: str, requester_role: str = Query("crew")):
+async def get_journals(author_id: str, user: User = Depends(current_user)):
     """Role-gated: only author or flight_surgeon role can view entries."""
     conn = await get_conn()
     try:
@@ -262,8 +290,7 @@ async def get_journals(author_id: str, requester_role: str = Query("crew")):
             "SELECT * FROM journals WHERE author_id=$1 ORDER BY mission_day DESC, created_at DESC",
             author_id
         )
-        # In production, requester_role comes from Keycloak JWT claim
-        if requester_role not in ("flight_surgeon", "author"):
+        if not (user.is_self(author_id) or user.has_any(FLIGHT_SURGEON)):
             # Return redacted version for non-privileged crew
             return [{"id": r["id"], "mission_day": r["mission_day"],
                      "title": r["title"], "body": "[PRIVATE]"} for r in rows]
@@ -272,9 +299,8 @@ async def get_journals(author_id: str, requester_role: str = Query("crew")):
         await conn.close()
 
 @app.get("/api/v1/journal/search")
-async def search_journals(author_id: str, keyword: str, requester_role: str = Query("crew")):
-    if requester_role not in ("flight_surgeon", "author"):
-        raise HTTPException(403, "Access denied")
+async def search_journals(author_id: str, keyword: str, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, author_id, FLIGHT_SURGEON)
     conn = await get_conn()
     try:
         rows = await conn.fetch(
@@ -286,9 +312,17 @@ async def search_journals(author_id: str, keyword: str, requester_role: str = Qu
         await conn.close()
 
 @app.post("/api/v1/journal/upload/{journal_id}")
-async def upload_journal_media(journal_id: int, file: UploadFile = File(...)):
-    safe_name = f"journal_{journal_id}_{file.filename}"
-    path = os.path.join(MEDIA_DIR, safe_name)
+async def upload_journal_media(journal_id: int, file: UploadFile = File(...),
+                               user: User = Depends(current_user)):
+    conn = await get_conn()
+    try:
+        author_id = await conn.fetchval("SELECT author_id FROM journals WHERE id=$1", journal_id)
+    finally:
+        await conn.close()
+    if author_id is None:
+        raise HTTPException(404, "Journal not found")
+    ensure_self_or_roles(user, author_id)
+    safe_name, path = media_path(f"journal_{journal_id}", file.filename)
     with open(path, "wb") as f:
         f.write(await file.read())
     conn = await get_conn()
@@ -309,7 +343,8 @@ class BriefingCreate(BaseModel):
     assignments: List[dict] = []   # [{crew_id, task}]
 
 @app.post("/api/v1/briefing/create", status_code=201)
-async def create_briefing(req: BriefingCreate):
+async def create_briefing(req: BriefingCreate, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, req.created_by)
     mission_day = await current_mission_day()
     snap = await eclss_snapshot()
     conn = await get_conn()
@@ -329,7 +364,7 @@ async def create_briefing(req: BriefingCreate):
     finally:
         await conn.close()
 
-@app.get("/api/v1/briefing/{briefing_id}")
+@app.get("/api/v1/briefing/{briefing_id}", dependencies=[Depends(current_user)])
 async def get_briefing(briefing_id: int):
     conn = await get_conn()
     try:
@@ -346,7 +381,7 @@ async def get_briefing(briefing_id: int):
     finally:
         await conn.close()
 
-@app.get("/api/v1/briefing/latest/today")
+@app.get("/api/v1/briefing/latest/today", dependencies=[Depends(current_user)])
 async def latest_briefing():
     day = await current_mission_day()
     conn = await get_conn()
@@ -365,7 +400,8 @@ class AckItem(BaseModel):
     item_index: int
 
 @app.post("/api/v1/briefing/{briefing_id}/ack", status_code=201)
-async def ack_briefing_item(briefing_id: int, req: AckItem):
+async def ack_briefing_item(briefing_id: int, req: AckItem, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, req.crew_id)
     conn = await get_conn()
     try:
         await conn.execute(
@@ -398,7 +434,8 @@ class PushSubscribe(BaseModel):
     auth: str
 
 @app.post("/api/v1/push/subscribe", status_code=201)
-async def subscribe_push(req: PushSubscribe):
+async def subscribe_push(req: PushSubscribe, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, req.user_id)
     conn = await get_conn()
     try:
         await conn.execute(
@@ -413,7 +450,7 @@ async def subscribe_push(req: PushSubscribe):
     finally:
         await conn.close()
 
-@app.post("/api/v1/push/send")
+@app.post("/api/v1/push/send", dependencies=[Depends(require_roles(MCC_OPERATOR, COMMANDER))])
 async def send_push_notification(user_id: str, title: str, body: str):
     """
     Dispatches a Web Push notification.
@@ -441,11 +478,12 @@ async def upload_video_log(
     title: str = Form(""),
     keywords: str = Form(""),
     duration_seconds: float = Form(0),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    user: User = Depends(current_user),
 ):
+    ensure_self_or_roles(user, crew_id)
     mission_day = await current_mission_day()
-    safe_name = f"vlog_{crew_id}_{int(time.time())}_{file.filename}"
-    path = os.path.join(MEDIA_DIR, safe_name)
+    safe_name, path = media_path(f"vlog_{crew_id}_{int(time.time())}", file.filename)
     with open(path, "wb") as f:
         f.write(await file.read())
 
@@ -466,7 +504,7 @@ async def upload_video_log(
     finally:
         await conn.close()
 
-@app.get("/api/v1/videolog")
+@app.get("/api/v1/videolog", dependencies=[Depends(current_user)])
 async def list_video_logs(crew_id: Optional[str] = None, mission_day: Optional[int] = None,
                           keyword: Optional[str] = None):
     conn = await get_conn()
@@ -485,7 +523,7 @@ async def list_video_logs(crew_id: Optional[str] = None, mission_day: Optional[i
     finally:
         await conn.close()
 
-@app.get("/api/v1/videolog/stream/{log_id}")
+@app.get("/api/v1/videolog/stream/{log_id}", dependencies=[Depends(current_user)])
 async def stream_video(log_id: int):
     conn = await get_conn()
     try:

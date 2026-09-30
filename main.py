@@ -5,6 +5,7 @@ India Moon Mars Operating System · FastAPI microservice entrypoint
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from services.telemetry_api import router as telemetry_router
+from services.mission_api import downloads as mission_downloads, router as mission_router, start_archiver
 
 app = FastAPI(
     title="IMM-OS Backend",
@@ -23,6 +24,13 @@ app.add_middleware(
 )
 
 app.include_router(telemetry_router)
+app.include_router(mission_router)
+app.include_router(mission_downloads)
+
+
+@app.on_event("startup")
+async def startup():
+    await start_archiver()        # each finished sol → MISSION_ARCHIVE_DIR (services/mission_api.py)
 
 
 @app.get("/health", tags=["System"])
