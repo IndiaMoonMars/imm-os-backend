@@ -61,6 +61,7 @@ class Mission:
     notes: str = ""
     ended_at: Optional[float] = None  # ended early (or closed after the last sol)
     created_by: Optional[str] = None
+    label: str = ""                   # "" | "restarted" | "test" | "aborted" (see LABELS)
 
     @property
     def end(self) -> float:
@@ -70,6 +71,31 @@ class Mission:
         d = asdict(self)
         d.update(end=self.end, start_ist=ist(self.start), end_ist=ist(self.end))
         return d
+
+
+# Mission labels. Nothing is ever deleted: a label only changes where a mission is listed.
+#   restarted  replaced by a new mission with the same settings (kept in History, downloadable)
+#   test       a dry run: kept, left out of History's default list
+#   aborted    a false start (only within ABORT_WINDOW_S of Sol 1): no longer the current mission
+LABELS = ("", "restarted", "test", "aborted")
+ABORT_WINDOW_S = 3600
+
+
+def status(m: Mission, now: float) -> str:
+    """One word for History: the label if it has one, else where the clock is."""
+    if m.label:
+        return m.label
+    phase = clock(m, now)["phase"]
+    if phase == "pre":
+        return "upcoming"
+    if phase == "active":
+        return "running"
+    return "ended early" if m.ended_at and m.ended_at < m.end else "complete"
+
+
+def abortable(m: Mission, now: float) -> bool:
+    """A false start can be aborted until an hour into Sol 1 (not after it ended or was relabelled)."""
+    return not m.label and (m.ended_at is None or m.ended_at > now) and now < m.start + ABORT_WINDOW_S
 
 
 def ist(ts: Optional[float], fmt: str = "%a %d %b %Y, %H:%M:%S IST") -> Optional[str]:
@@ -103,6 +129,8 @@ def clock(m: Optional[Mission], now: float) -> dict:
     """The mission clock for the top bar: phase, sol, time into the sol, progress."""
     if m is None:
         return {"phase": "none"}
+    if m.ended_at is not None and m.ended_at <= m.start and now >= m.ended_at:      # ended before Sol 1
+        return {"phase": "complete", "sol": 0, "met_s": 0.0, "progress": 0.0}
     if now < m.start:
         return {"phase": "pre", "sol": 0, "t_minus_s": m.start - now, "progress": 0.0}
     end = min(m.end, m.ended_at) if m.ended_at else m.end

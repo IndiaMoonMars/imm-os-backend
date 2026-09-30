@@ -6,6 +6,10 @@ IMM-OS mission record API (/api/mission, in the backend service).
     POST   /api/mission/start              start a mission: name, T0 (IST, default now), sols, crew
     PATCH  /api/mission                    rename, correct T0, change the number of sols
     POST   /api/mission/end                end the mission now
+    POST   /api/mission/restart            end it (kept as 'restarted' or 'test') and start again, same settings
+    POST   /api/mission/abort              false start, within an hour of Sol 1: kept, labelled 'aborted'
+    POST   /api/mission/label              mark a mission as a test run (or not)
+    GET    /api/mission/history            every mission, newest first (?all=1: tests and aborted too)
     GET    /api/mission/overview           sol cards: state, data coverage, dose
     GET    /api/mission/sol/{n}            one sol: min / mean / max per measurement, coverage, events
     GET    /api/mission/timeline           one measurement over the whole mission (10-min bands)
@@ -19,7 +23,8 @@ IMM-OS mission record API (/api/mission, in the backend service).
     GET    /api/mission/report/{n}         printable sol report (print → PDF)
 
 Statistics use good-quality readings only (warm-up and other suspect readings are stored but
-left out); coverage counts every reading. Real sensors only unless ?sim=1.
+left out); coverage counts every reading. Real sensors only unless ?sim=1. The reads and downloads
+take ?mission=<id> to open an earlier mission from History. Nothing here ever deletes readings.
 
 The archiver writes each sol, 10 minutes after it ends, to MISSION_ARCHIVE_DIR/<mission>/sol-NN/
 (the same ZIP contents, plus rollup.json and SHA256SUMS) and notes it in the mission log.
@@ -96,6 +101,7 @@ CREATE TABLE IF NOT EXISTS mission_sols (
     summary JSONB NOT NULL DEFAULT '{}',
     PRIMARY KEY (mission_id, sol)
 );
+ALTER TABLE missions ADD COLUMN IF NOT EXISTS label TEXT NOT NULL DEFAULT '';
 """
 
 
@@ -108,7 +114,8 @@ def _mission(row) -> Optional[M.Mission]:
         return None
     return M.Mission(id=row["id"], name=row["name"], start=row["start_at"].timestamp(), sols=row["sols"],
                      crew=row["crew"], notes=row["notes"] or "", created_by=row["created_by"],
-                     ended_at=row["ended_at"].timestamp() if row["ended_at"] else None)
+                     ended_at=row["ended_at"].timestamp() if row["ended_at"] else None,
+                     label=row["label"] or "")
 
 
 class MissionStore:
@@ -135,9 +142,27 @@ class MissionStore:
             return self.pool
 
     async def current(self) -> Optional[M.Mission]:
-        """The newest mission (running, upcoming or finished)."""
+        """The newest mission that wasn't aborted (running, upcoming or finished)."""
         pool = await self._pool()
-        return _mission(await pool.fetchrow("SELECT * FROM missions ORDER BY id DESC LIMIT 1"))
+        return _mission(await pool.fetchrow("SELECT * FROM missions WHERE label <> 'aborted' ORDER BY id DESC LIMIT 1"))
+
+    async def get(self, mid: int) -> Optional[M.Mission]:
+        pool = await self._pool()
+        return _mission(await pool.fetchrow("SELECT * FROM missions WHERE id = $1", mid))
+
+    async def history(self) -> List[Tuple[M.Mission, int, int]]:
+        """Every mission, newest first, with its archived sols and their readings."""
+        pool = await self._pool()
+        rows = await pool.fetch("SELECT m.*, COUNT(s.sol) AS archived_sols, COALESCE(SUM(s.readings), 0) AS readings "
+                                "FROM missions m LEFT JOIN mission_sols s ON s.mission_id = m.id "
+                                "GROUP BY m.id ORDER BY m.id DESC")
+        return [(_mission(r), int(r["archived_sols"]), int(r["readings"])) for r in rows]
+
+    async def recent(self, n: int = 5) -> List[M.Mission]:
+        """The newest missions that may still have sols to archive (aborted ones never do)."""
+        pool = await self._pool()
+        return [_mission(r) for r in await pool.fetch(
+            "SELECT * FROM missions WHERE label <> 'aborted' ORDER BY id DESC LIMIT $1", n)]
 
     async def create(self, name, start, sols, crew, notes, actor) -> M.Mission:
         pool = await self._pool()
@@ -149,7 +174,7 @@ class MissionStore:
     async def update(self, mid: int, **fields) -> M.Mission:
         pool = await self._pool()
         cols = {"name": "name", "start": "start_at", "sols": "sols", "crew": "crew", "notes": "notes",
-                "ended_at": "ended_at"}
+                "ended_at": "ended_at", "label": "label"}
         sets, args = [], [mid]
         for k, v in fields.items():
             args.append(_ts(v) if k in ("start", "ended_at") else v)
@@ -198,7 +223,13 @@ class MissionStore:
 store = MissionStore()
 
 
-async def mission_or_404() -> M.Mission:
+async def mission_or_404(mid: Optional[int] = None) -> M.Mission:
+    """The current mission, or mission `mid` (History: any earlier one, read-only)."""
+    if mid is not None:
+        m = await store.get(mid)
+        if m is None:
+            raise HTTPException(404, f"no mission #{mid}")
+        return m
     m = await store.current()
     if m is None:
         raise HTTPException(404, "no mission yet: start one on the Mission page")
@@ -375,6 +406,20 @@ class PatchBody(BaseModel):
     notes: Optional[str] = Field(None, max_length=2000)
 
 
+class RestartBody(BaseModel):
+    confirm: str = Field(..., description="the mission's name, typed to confirm")
+    keep_as: str = Field("restarted", description="what the old mission becomes: restarted | test")
+    start_ist: Optional[str] = Field(None, description="the new Sol 1 start in IST (default: now)")
+
+
+class ConfirmBody(BaseModel):
+    confirm: str = Field(..., description="the mission's name, typed to confirm")
+
+
+class LabelBody(BaseModel):
+    test: bool = Field(..., description="true: mark as a test run; false: a normal mission again")
+
+
 class NoteBody(BaseModel):
     message: str = Field(..., min_length=1, max_length=500)
 
@@ -413,7 +458,7 @@ async def start_mission(body: StartBody, user: User = Depends(planner)):
     start = _start_from(body.start_ist, now)
     m = await store.create(body.name.strip(), start, body.sols, body.crew, body.notes, user.username)
     await store.event(m.id, "mission", f"Mission {m.name} created: Sol 1 starts {M.ist(m.start)}", user.username)
-    return {"mission": m.to_json(), "clock": M.clock(m, now)}
+    return {"mission": m.to_json(), "clock": M.clock(m, max(now, m.start) if not body.start_ist else now)}
 
 
 @router.patch("")
@@ -443,6 +488,79 @@ async def end_mission(user: User = Depends(planner)):
     return {"mission": new.to_json(), "clock": M.clock(new, now)}
 
 
+def _confirmed(m: M.Mission, typed: str) -> None:
+    if typed.strip() != m.name.strip():
+        raise HTTPException(422, f"type the mission name exactly to confirm: {m.name}")
+
+
+@router.post("/restart")
+async def restart_mission(body: RestartBody, user: User = Depends(planner)):
+    """End the current mission (kept, labelled) and start a new one with the same settings. Nothing is deleted."""
+    m = await mission_or_404()
+    _confirmed(m, body.confirm)
+    if body.keep_as not in ("restarted", "test"):
+        raise HTTPException(422, "keep_as: restarted or test")
+    now = time.time()
+    running = M.clock(m, now)["phase"] in ("pre", "active")
+    fields = {"label": body.keep_as if running or body.keep_as == "test" else m.label}
+    if running:
+        fields["ended_at"] = now
+    start = _start_from(body.start_ist, now)
+    old = await store.update(m.id, **fields)
+    new = await store.create(m.name, start, m.sols, m.crew, m.notes, user.username)
+    where = f"on Sol {M.sol_of(m, now)}" if now >= m.start else "before Sol 1"
+    await store.event(m.id, "mission", f"Mission restarted by {user.username} {where}; kept as '{old.label or 'complete'}'. "
+                                       f"Continues as mission #{new.id}", user.username)
+    await store.event(new.id, "mission", f"Mission {new.name} created (restart of mission #{m.id}): Sol 1 starts "
+                                         f"{M.ist(new.start)}", user.username)
+    _cache.clear()
+    at = max(now, new.start) if not body.start_ist else now      # T0 = now survives the database's rounding
+    return {"mission": new.to_json(), "clock": M.clock(new, at), "previous": old.to_json()}
+
+
+@router.post("/abort")
+async def abort_mission(body: ConfirmBody, user: User = Depends(planner)):
+    """A false start: only until an hour into Sol 1. The mission is kept (label 'aborted') with its readings."""
+    m = await mission_or_404()
+    _confirmed(m, body.confirm)
+    now = time.time()
+    if not M.abortable(m, now):
+        raise HTTPException(409, "only a mission less than an hour into Sol 1 can be aborted: use End or Restart")
+    await store.update(m.id, label="aborted", ended_at=now)
+    await store.event(m.id, "mission", f"Mission aborted by {user.username} (false start)", user.username)
+    _cache.clear()
+    nxt = await store.current()
+    return {"aborted": m.id, "mission": nxt.to_json() if nxt else None, "clock": M.clock(nxt, now)}
+
+
+@router.post("/label")
+async def label_mission(body: LabelBody, mission: Optional[int] = None, user: User = Depends(planner)):
+    """Mark a mission (the current one, or ?mission=id) as a test run, or back to a normal one."""
+    m = await mission_or_404(mission)
+    if m.label == "aborted":
+        raise HTTPException(409, "an aborted mission stays aborted")
+    label = "test" if body.test else ""
+    new = await store.update(m.id, label=label)
+    await store.event(m.id, "mission", f"{'Marked as a test run' if body.test else 'Test label removed'} by {user.username}",
+                      user.username)
+    return {"mission": new.to_json()}
+
+
+@router.get("/history")
+async def mission_history(all: bool = False):
+    """Every mission, newest first. Test runs and aborted missions only with ?all=1."""
+    now = time.time()
+    current = await store.current()
+    out = []
+    for m, archived, readings in await store.history():
+        if not all and m.label in ("test", "aborted"):
+            continue
+        c = M.clock(m, now)
+        out.append({**m.to_json(), "status": M.status(m, now), "current": bool(current and m.id == current.id),
+                    "sol": c.get("sol"), "phase": c["phase"], "archived_sols": archived, "readings": readings})
+    return {"missions": out}
+
+
 @router.post("/events")
 async def add_note(body: NoteBody, user: User = Depends(current_user)):
     m = await mission_or_404()
@@ -451,9 +569,9 @@ async def add_note(body: NoteBody, user: User = Depends(current_user)):
 
 
 @router.get("/overview")
-async def overview(sim: bool = False):
+async def overview(sim: bool = False, mission: Optional[int] = None):
     now = time.time()
-    m = await mission_or_404()
+    m = await mission_or_404(mission)
     archived = await store.archived(m.id)
     cards = M.sol_states(m, now)
     per_sol, cov = {}, {}
@@ -475,9 +593,9 @@ async def overview(sim: bool = False):
 
 
 @router.get("/sol/{n}")
-async def sol_detail(n: int, sim: bool = False):
+async def sol_detail(n: int, sim: bool = False, mission: Optional[int] = None):
     now = time.time()
-    m = await mission_or_404()
+    m = await mission_or_404(mission)
     if not 1 <= n <= m.sols:
         raise HTTPException(404, f"no Sol {n} in this mission")
     values, counts = await sol_rollup(m, n, not sim, now)
@@ -499,24 +617,25 @@ def _measurement(key: str) -> str:
 
 
 @router.get("/timeline")
-async def get_timeline(measurement: str = "co2", sim: bool = False):
+async def get_timeline(measurement: str = "co2", sim: bool = False, mission: Optional[int] = None):
     now = time.time()
-    m = await mission_or_404()
+    m = await mission_or_404(mission)
     return {**M.timeline(m, await all_values(m, not sim, now), _measurement(measurement)),
-            "now_h": (min(now, m.end) - m.start) / 3600, "sols": m.sols}
+            "now_h": (min(now, m.end, m.ended_at or m.end) - m.start) / 3600, "sols": m.sols,
+            "ended": bool(m.ended_at and m.ended_at <= now)}
 
 
 @router.get("/overlay")
-async def get_overlay(measurement: str = "temperature", sim: bool = False):
+async def get_overlay(measurement: str = "temperature", sim: bool = False, mission: Optional[int] = None):
     now = time.time()
-    m = await mission_or_404()
+    m = await mission_or_404(mission)
     return M.overlay(m, await all_values(m, not sim, now), _measurement(measurement))
 
 
 @router.get("/health")
-async def get_health(sim: bool = False):
+async def get_health(sim: bool = False, mission: Optional[int] = None):
     now = time.time()
-    m = await mission_or_404()
+    m = await mission_or_404(mission)
     cov = {}
     for n in started_sols(m, now):
         values, counts = await sol_rollup(m, n, not sim, now)
@@ -526,9 +645,9 @@ async def get_health(sim: bool = False):
 
 
 @router.get("/dose")
-async def get_dose(sim: bool = False):
+async def get_dose(sim: bool = False, mission: Optional[int] = None):
     now = time.time()
-    m = await mission_or_404()
+    m = await mission_or_404(mission)
     return M.dose_series(m, await all_values(m, not sim, now))
 
 
@@ -671,9 +790,9 @@ def _zip_dir(src: str, zip_path: str, prefix: str) -> None:
 
 
 @downloads.get("/download/sol/{n}")
-async def download_sol(n: int, sim: bool = False, who: str = Depends(download_user)):
-    m = await mission_or_404()
-    if not 1 <= n <= m.sols or time.time() < M.sol_bounds(m, n)[0]:
+async def download_sol(n: int, sim: bool = False, mission: Optional[int] = None, who: str = Depends(download_user)):
+    m = await mission_or_404(mission)
+    if not 1 <= n <= m.sols or time.time() < M.sol_bounds(m, n)[0] or (m.ended_at and M.sol_bounds(m, n)[0] >= m.ended_at):
         raise HTTPException(404, f"Sol {n} has no data yet")
     name = f"{_slug(m.name)}-sol-{n:02d}"
     tmp = tempfile.mkdtemp(prefix="imm-sol-")
@@ -733,8 +852,8 @@ def write_mission_csv(m: M.Mission, path: str, real_only: bool = True) -> int:
 
 
 @downloads.get("/download/mission")
-async def download_mission(sim: bool = False, who: str = Depends(download_user)):
-    m = await mission_or_404()
+async def download_mission(sim: bool = False, mission: Optional[int] = None, who: str = Depends(download_user)):
+    m = await mission_or_404(mission)
     tmp = tempfile.mkdtemp(prefix="imm-mission-")
     name = f"{_slug(m.name)}-all-sols-1min.csv"
     path = os.path.join(tmp, name)
@@ -784,8 +903,8 @@ th{{font-size:11px;text-transform:uppercase;color:#555}}small{{color:#666;margin
 
 
 @downloads.get("/report/{n}", response_class=HTMLResponse)
-async def sol_report(n: int, sim: bool = False, who: str = Depends(download_user)):
-    m = await mission_or_404()
+async def sol_report(n: int, sim: bool = False, mission: Optional[int] = None, who: str = Depends(download_user)):
+    m = await mission_or_404(mission)
     if not 1 <= n <= m.sols:
         raise HTTPException(404, f"no Sol {n} in this mission")
     now = time.time()
@@ -798,11 +917,16 @@ async def sol_report(n: int, sim: bool = False, who: str = Depends(download_user
 # ── the archiver ───────────────────────────────────────────────────
 
 async def archive_due(now: Optional[float] = None) -> List[int]:
-    """Archive every finished sol not archived yet. → the sols archived now."""
+    """Archive every finished sol not archived yet, of the current mission and the few before it (a
+    restarted mission's last sol settles after the restart). → the sols archived now."""
     now = now or time.time()
-    m = await store.current()
-    if m is None:
-        return []
+    out = []
+    for m in await store.recent():
+        out += await _archive_mission(m, now)
+    return out
+
+
+async def _archive_mission(m: M.Mission, now: float) -> List[int]:
     done = await store.archived(m.id)
     out = []
     for n in range(1, m.sols + 1):

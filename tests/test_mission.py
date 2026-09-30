@@ -118,7 +118,18 @@ class FakeStore:
         self.missions, self.log, self.done = [], [], {}
 
     async def current(self):
-        return self.missions[-1] if self.missions else None
+        live = [m for m in self.missions if m.label != "aborted"]
+        return live[-1] if live else None
+
+    async def get(self, mid):
+        return next((m for m in self.missions if m.id == mid), None)
+
+    async def history(self):
+        return [(m, len(self.done.get(m.id, {})), sum(d["readings"] for d in self.done.get(m.id, {}).values()))
+                for m in reversed(self.missions)]
+
+    async def recent(self, n=5):
+        return [m for m in reversed(self.missions) if m.label != "aborted"][:n]
 
     async def create(self, name, start, sols, crew, notes, actor):
         m = M.Mission(len(self.missions) + 1, name, start, sols, crew, notes or "", None, actor)
@@ -126,22 +137,22 @@ class FakeStore:
         return m
 
     async def update(self, mid, **f):
-        m = self.missions[-1]
+        m = await self.get(mid)
         for k, v in f.items():
             setattr(m, k, v)
         return m
 
     async def event(self, mid, kind, message, actor=None, at=None, details=None):
-        self.log.append({"at": at or 0, "kind": kind, "message": message, "actor": actor})
+        self.log.append({"mission": mid, "at": at or 0, "kind": kind, "message": message, "actor": actor})
 
     async def events(self, mid, start, end):
-        return list(self.log)
+        return [e for e in self.log if e["mission"] == mid]
 
     async def archived(self, mid):
-        return dict(self.done)
+        return dict(self.done.get(mid, {}))
 
     async def mark_archived(self, mid, sol, path, readings, summary):
-        self.done[sol] = {"path": path, "readings": readings}
+        self.done.setdefault(mid, {})[sol] = {"path": path, "readings": readings}
 
 
 @pytest.fixture
@@ -274,3 +285,86 @@ def test_edge_nodes_can_read_the_mission_clock(mission_env):
     assert client.get("/api/mission").status_code == 403                  # the full API stays crew / MCC only
     r = client.get("/api/mission/clock").json()
     assert r["mission"]["start"] == T0 and r["clock"]["sol"] == 3
+
+
+# ── restart, test runs, abort, history (nothing is ever deleted) ────
+
+def test_restart_keeps_the_old_mission_and_starts_again_with_the_same_settings(mission_env):
+    fake, clock = mission_env
+    client.post("/api/mission/start", json={"name": "Alpha", "start_ist": "2026-09-27 02:48:16", "sols": 5, "crew": 4})
+    assert client.post("/api/mission/restart", json={"confirm": "alpha"}).status_code == 422      # name must match
+    assert client.post("/api/mission/restart", json={"confirm": "Alpha", "keep_as": "gone"}).status_code == 422
+    app.dependency_overrides[current_user] = lambda: User("crew1", frozenset({"crew"}))
+    assert client.post("/api/mission/restart", json={"confirm": "Alpha"}).status_code == 403
+    app.dependency_overrides[current_user] = lambda: User("pratham", frozenset({"commander"}))
+    r = client.post("/api/mission/restart", json={"confirm": "Alpha"}).json()
+    now = clock["now"]
+    assert r["previous"]["label"] == "restarted" and r["previous"]["ended_at"] == now
+    new = r["mission"]
+    assert new["id"] == 2 and new["name"] == "Alpha" and new["sols"] == 5 and new["crew"] == 4 and new["start"] == now
+    assert r["clock"]["phase"] == "active" and r["clock"]["sol"] == 1
+    assert client.get("/api/mission").json()["mission"]["id"] == 2                    # the new one is current
+    assert any("restarted by pratham on Sol 3" in e["message"] and "#2" in e["message"] for e in fake.log)
+    # the old one is still there, read-only, with its three sols
+    o = client.get("/api/mission/overview", params={"mission": 1}).json()
+    assert o["mission"]["label"] == "restarted" and [s["state"] for s in o["sols"]] == ["done", "done", "done", "upcoming", "upcoming"]
+    assert client.get("/api/mission/sol/3", params={"mission": 1}).json()["measurements"]["temperature"]["mean"] == 25
+    t = client.get("/api/mission/timeline", params={"mission": 1, "measurement": "co2"}).json()
+    assert t["ended"] and t["now_h"] == pytest.approx(62)                    # where it stopped, not the planned end
+    assert client.get("/api/mission/sol/1", params={"mission": 9}).status_code == 404
+    token = api.make_token("pratham")
+    assert client.get("/api/mission/report/2", params={"mission": 1, "dl": token}).status_code == 200
+    assert client.get("/api/mission/download/sol/4", params={"mission": 1, "dl": token}).status_code == 404  # never ran
+    h = client.get("/api/mission/history").json()["missions"]
+    assert [(m["id"], m["status"], m["current"]) for m in h] == [(2, "running", True), (1, "restarted", False)]
+
+
+def test_restart_at_a_chosen_time_and_as_test_run(mission_env):
+    client.post("/api/mission/start", json={"name": "Dry run", "start_ist": "2026-09-27 02:48:16"})
+    r = client.post("/api/mission/restart", json={"confirm": "Dry run", "keep_as": "test",
+                                                  "start_ist": "2026-10-04 10:00"}).json()
+    assert r["previous"]["label"] == "test" and r["clock"]["phase"] == "pre"
+    assert r["mission"]["start_ist"] == "Sun 04 Oct 2026, 10:00:00 IST"
+    assert [m["id"] for m in client.get("/api/mission/history").json()["missions"]] == [2]      # tests hidden
+    assert [m["id"] for m in client.get("/api/mission/history", params={"all": True}).json()["missions"]] == [2, 1]
+    # restarting a mission that hasn't started yet: it ends before Sol 1 and reads as over
+    r = client.post("/api/mission/restart", json={"confirm": "Dry run"}).json()
+    old = client.get("/api/mission/overview", params={"mission": 2}).json()
+    assert r["previous"]["label"] == "restarted" and old["clock"]["phase"] == "complete"
+    assert all(s["state"] == "upcoming" for s in old["sols"])
+
+
+def test_abort_only_a_false_start_and_label_test_runs(mission_env):
+    fake, clock = mission_env
+    client.post("/api/mission/start", json={"name": "Alpha", "start_ist": "2026-09-27 02:48:16"})
+    assert client.post("/api/mission/abort", json={"confirm": "Alpha"}).status_code == 409     # Sol 3: too late
+    clock["now"] = T0 + 86400 * 10
+    client.post("/api/mission/start", json={"name": "Beta"})                                   # after Alpha ended
+    clock["now"] += 1800
+    assert client.post("/api/mission/abort", json={"confirm": "Beta?"}).status_code == 422
+    r = client.post("/api/mission/abort", json={"confirm": "Beta"}).json()
+    assert r["aborted"] == 2 and r["mission"]["name"] == "Alpha"                  # Alpha is current again
+    assert client.get("/api/mission").json()["mission"]["id"] == 1                # the Pi files by Alpha (over)
+    assert fake.missions[1].label == "aborted" and fake.missions[1].ended_at == clock["now"]
+    assert client.post("/api/mission/label", params={"mission": 2}, json={"test": True}).status_code == 409
+    assert client.post("/api/mission/label", json={"test": True}).json()["mission"]["label"] == "test"
+    assert client.get("/api/mission/history").json()["missions"] == []
+    statuses = [m["status"] for m in client.get("/api/mission/history", params={"all": 1}).json()["missions"]]
+    assert statuses == ["aborted", "test"]
+    assert client.post("/api/mission/label", json={"test": False}).json()["mission"]["label"] == ""
+    assert client.get("/api/mission/history").json()["missions"][0]["status"] == "complete"
+
+
+def test_archiver_finishes_a_restarted_mission_too(mission_env, monkeypatch):
+    fake, clock = mission_env
+    client.post("/api/mission/start", json={"name": "Alpha", "start_ist": "2026-09-27 02:48:16"})
+
+    def csvs(m, n, target, real_only=True):
+        os.makedirs(target, exist_ok=True)
+        return {"bme280.csv": 10}
+    monkeypatch.setattr(api, "write_sol_csvs", csvs)
+    client.post("/api/mission/restart", json={"confirm": "Alpha"})
+    assert asyncio.run(api.archive_due(clock["now"])) == [1, 2]              # Sol 3 is still settling
+    clock["now"] += api.SETTLE_S + 1
+    assert asyncio.run(api.archive_due(clock["now"])) == [3]                 # the cut-short Sol 3 of mission #1
+    assert sorted(fake.done[1]) == [1, 2, 3] and 2 not in fake.done
