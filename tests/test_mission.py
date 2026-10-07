@@ -143,7 +143,16 @@ class FakeStore:
         return m
 
     async def event(self, mid, kind, message, actor=None, at=None, details=None):
-        self.log.append({"mission": mid, "at": at or 0, "kind": kind, "message": message, "actor": actor})
+        self.log.append({"mission": mid, "at": at if at is not None else api.time.time(), "kind": kind,
+                         "message": message, "actor": actor, "details": details or {}})
+
+    async def manual_readings(self, mid, start, end):
+        out = {}
+        for e in sorted((e for e in self.log if e["mission"] == mid and e["kind"] == "reading"
+                         and start <= e["at"] < end), key=lambda e: e["at"]):
+            d = e["details"]
+            out[d["measurement"]] = {"value": d["value"], "unit": d["unit"], "at": e["at"], "by": e["actor"]}
+        return out
 
     async def events(self, mid, start, end):
         return [e for e in self.log if e["mission"] == mid]
@@ -288,6 +297,24 @@ def test_edge_nodes_can_read_the_mission_clock(mission_env):
 
 
 # ── restart, test runs, abort, history (nothing is ever deleted) ────
+
+def test_portable_manual_readings_are_logged_and_surfaced(mission_env):
+    fake, clock = mission_env
+    client.post("/api/mission/start", json={"name": "Alpha", "start_ist": "2026-09-27 02:48:16"})
+    assert client.post("/api/mission/reading", json={"measurement": "nope", "value": 1}).status_code == 422
+    r = client.post("/api/mission/reading", json={"measurement": "co2", "value": 812, "note": "Aranet4"})
+    assert r.status_code == 200 and r.json() == {"ok": True, "measurement": "co2", "value": 812.0, "unit": "ppm"}
+    assert any(e["kind"] == "reading" and "CO\u2082 812 ppm" in e["message"] and "Aranet4" in e["message"] for e in fake.log)
+    clock["now"] += 1                                                         # the view is a moment after logging
+    ov = client.get("/api/mission/overview").json()
+    assert ov["manual"]["co2"]["value"] == 812.0 and ov["manual"]["co2"]["unit"] == "ppm" and ov["manual"]["co2"]["by"] == "pratham"
+    # a later reading wins; it lands in the sol it was taken in
+    client.post("/api/mission/reading", json={"measurement": "co2", "value": 845})
+    clock["now"] += 1
+    assert client.get("/api/mission/overview").json()["manual"]["co2"]["value"] == 845.0
+    assert client.get("/api/mission/sol/3").json()["manual"]["co2"]["value"] == 845.0
+    assert client.get("/api/mission/sol/1").json()["manual"] == {}            # none taken in Sol 1
+
 
 def test_restart_keeps_the_old_mission_and_starts_again_with_the_same_settings(mission_env):
     fake, clock = mission_env

@@ -17,6 +17,7 @@ IMM-OS mission record API (/api/mission, in the backend service).
     GET    /api/mission/health             sensor × sol coverage grid
     GET    /api/mission/dose               cumulative radiation dose
     POST   /api/mission/events             a note in the mission log
+    POST   /api/mission/reading            log a portable-instrument reading (used when a sensor is down)
     POST   /api/mission/download-token     short-lived token for the download links below
     GET    /api/mission/download/sol/{n}   ZIP: per-sensor CSVs (every reading, IST and UTC) + summary
     GET    /api/mission/download/mission   CSV: 1-minute mean / min / max of every sensor, every sol
@@ -205,6 +206,18 @@ class MissionStore:
         except Exception:             # health monitor never ran here: no alarm tables yet
             pass
         return sorted(rows, key=lambda r: -r["at"])
+
+    async def manual_readings(self, mid: int, start: float, end: float) -> Dict[str, dict]:
+        """Latest hand-logged (portable-instrument) reading per measurement in the window."""
+        pool = await self._pool()
+        rows = await pool.fetch(
+            "SELECT DISTINCT ON (details->>'measurement') details->>'measurement' AS measurement, "
+            "at, actor, (details->>'value')::float8 AS value, details->>'unit' AS unit "
+            "FROM mission_events WHERE mission_id = $1 AND kind = 'reading' AND at >= $2 AND at < $3 "
+            "AND details ? 'measurement' ORDER BY details->>'measurement', at DESC",
+            mid, _ts(start), _ts(end))
+        return {r["measurement"]: {"value": r["value"], "unit": r["unit"],
+                                   "at": r["at"].timestamp(), "by": r["actor"]} for r in rows}
 
     async def archived(self, mid: int) -> Dict[int, dict]:
         pool = await self._pool()
@@ -424,6 +437,12 @@ class NoteBody(BaseModel):
     message: str = Field(..., min_length=1, max_length=500)
 
 
+class ReadingBody(BaseModel):
+    measurement: str = Field(..., description="one of the mission measurements, e.g. co2")
+    value: float = Field(..., description="the value read on the portable instrument")
+    note: str = Field("", max_length=200, description="e.g. the instrument used")
+
+
 def _start_from(text: Optional[str], now: float) -> float:
     if not text:
         return now
@@ -568,6 +587,21 @@ async def add_note(body: NoteBody, user: User = Depends(current_user)):
     return {"ok": True}
 
 
+@router.post("/reading")
+async def log_reading(body: ReadingBody, user: User = Depends(current_user)):
+    """Record a reading taken by hand on a portable instrument (e.g. CO2 while the SCD40 is down)."""
+    m = await mission_or_404()
+    spec = next((x for x in M.MEASUREMENTS if x[0] == body.measurement), None)
+    if spec is None:
+        raise HTTPException(422, f"measurement is one of {', '.join(M.MEASUREMENT_KEYS)}")
+    _key, label, unit, dp, _src = spec
+    shown = f"{body.value:.{dp}f} {unit}".strip()
+    msg = f"Portable reading · {label} {shown}" + (f" · {body.note.strip()}" if body.note.strip() else "")
+    await store.event(m.id, "reading", msg, user.username,
+                      details={"measurement": body.measurement, "value": body.value, "unit": unit})
+    return {"ok": True, "measurement": body.measurement, "value": body.value, "unit": unit}
+
+
 @router.get("/overview")
 async def overview(sim: bool = False, mission: Optional[int] = None):
     now = time.time()
@@ -588,8 +622,9 @@ async def overview(sim: bool = False, mission: Optional[int] = None):
         if c["sol"] in overall:
             c["coverage_pct"] = overall[c["sol"]]
     dose = M.dose_series(m, per_sol)
+    manual = await store.manual_readings(m.id, m.start, min(now, m.end))
     return {"mission": m.to_json(), "clock": M.clock(m, now), "sols": cards, "dose": dose,
-            "archive_dir": archive_dir(m)}
+            "manual": manual, "archive_dir": archive_dir(m)}
 
 
 @router.get("/sol/{n}")
@@ -607,6 +642,7 @@ async def sol_detail(n: int, sim: bool = False, mission: Optional[int] = None):
         if src:
             series[key] = [[p[0], p[1]] for p in M.buckets(values[tuple(src.split("."))], s["start"], 600)]
     s["series"] = series
+    s["manual"] = await store.manual_readings(m.id, s["start"], s["end"])
     return s
 
 
