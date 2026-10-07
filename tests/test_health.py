@@ -258,6 +258,20 @@ def test_board_brownouts_and_bme280_resets():
     assert "brownout" in keys["board.node-rpi-01.zone1.reboot"].message
 
 
+def test_board_self_heal_reboot_names_its_cause():
+    mon = HealthMonitor()
+    t = T0
+    for boots, reason, heal in ((25292, 1, 0), (25293, 3, 2)):
+        mon.ingest_reading({"data": {"sensor": "board", "node_id": "node-rpi-01", "zone": "zone_a", "timestamp": t,
+                                     "q": "good", "qf": [], "uptime_s": 1, "bme_resets": 0, "boot_count": boots,
+                                     "reset_reason": reason, "i2c_err": 0, "heal_cause": heal}}, t)
+        mon.tick(t)
+        t += 10
+    a = {a.key: a for a in mon.alarms.open()}["board.node-rpi-01.zone_a.reboot"]
+    assert a.severity == "caution"                              # it was unreachable before it healed itself
+    assert "restarted (self-heal reboot: Wi-Fi lost), 1 time(s) in 15 min" in a.message
+
+
 def test_component_safe_mode_and_silence():
     mon = HealthMonitor()
     mon.ingest_component({"state": "SAFE", "reason": "no fresh temperature/humidity: relays OFF", "interval_s": 60},

@@ -1,7 +1,9 @@
 """Mission record: sols, IST, per-sol statistics, the API, downloads and the sol archiver."""
 import asyncio
+import csv
 import json
 import os
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -164,6 +166,21 @@ class FakeStore:
         self.done.setdefault(mid, {})[sol] = {"path": path, "readings": readings}
 
 
+BOARD: list = []          # board-health rows the fake InfluxDB holds (board_rows)
+
+
+def board_health(t0, t1, boot, uptime0, reset_reason=1, heal_cause=None, node="node-rpi-01", zone="zone_a"):
+    """The ESP32 board's health rows, every 10 s from t0 to t1 (uptime counting from uptime0)."""
+    rows = []
+    for t in range(int(t0), int(t1), 10):
+        r = {"t": float(t), "node_id": node, "zone": zone, "boot_count": float(boot),
+             "uptime_s": float(uptime0 + t - t0), "reset_reason": float(reset_reason)}
+        if heal_cause is not None:
+            r["heal_cause"] = float(heal_cause)
+        rows.append(r)
+    return rows
+
+
 @pytest.fixture
 def mission_env(monkeypatch, tmp_path):
     fake = FakeStore()
@@ -183,6 +200,8 @@ def mission_env(monkeypatch, tmp_path):
                   ("geiger", "node-rpi-01", "exterior"): {int(start + i * 60): 60 for i in range(mins)}}
         return values, counts
     monkeypatch.setattr(api, "query_rollup", rollup)
+    monkeypatch.setattr(api, "board_rows", lambda start, end, real_only=True: [r for r in BOARD if start <= r["t"] < end])
+    BOARD.clear()
     app.dependency_overrides[current_user] = lambda: User("pratham", frozenset({"commander"}))
     yield fake, clock
     app.dependency_overrides.clear()
@@ -395,3 +414,93 @@ def test_archiver_finishes_a_restarted_mission_too(mission_env, monkeypatch):
     clock["now"] += api.SETTLE_S + 1
     assert asyncio.run(api.archive_due(clock["now"])) == [3]                 # the cut-short Sol 3 of mission #1
     assert sorted(fake.done[1]) == [1, 2, 3] and 2 not in fake.done
+
+
+# ── ESP32 board restarts in the mission data ─────────────────────────
+
+def test_board_restarts_found_from_health_rows_with_cause_and_gap():
+    # boot 25292 runs, goes silent (unreachable) at +1000 s, the firmware reboots itself (Wi-Fi lost)
+    # and comes back as boot 25293 at +1190 s; the external board (no boot counting) is ignored
+    rows = (board_health(T0, T0 + 1000, 25292, 38000)
+            + board_health(T0 + 1190, T0 + 2000, 25293, 1, reset_reason=3, heal_cause=2)
+            + [{"t": T0 + 5.0, "node_id": "node-rpi-01", "zone": "exterior", "uptime_s": 9.0}])
+    segs = api.boot_segments(rows)
+    assert list(segs) == [("node-rpi-01", "zone_a")] and [x["boot"] for x in segs[("node-rpi-01", "zone_a")]] == [25292, 25293]
+    rb = api.board_reboots(segs, T0, T0 + 86400)
+    assert len(rb) == 1                                         # boot 25292 started before the window
+    r = rb[0]
+    assert r["at"] == pytest.approx(T0 + 1189) and r["boot"] == 25293 and r["gap_s"] == 200
+    assert r["why"] == "self-heal reboot: Wi-Fi lost" and r["at_ist"].endswith("IST")
+    ev = api.reboot_event(r)
+    assert ev["kind"] == "board.reboot" and ev["severity"] == "caution"
+    assert ev["message"] == "ESP32 board on node-rpi-01 (zone_a) restarted: self-heal reboot: Wi-Fi lost (boot 25293, no data for ~200 s)"
+    # a RESET-button press is told apart from the firmware's own reboot; a power-on is advisory
+    assert api.restart_why(2, 0) == "RESET button" and api.restart_why(9, 0) == "brownout (supply dipped)"
+    assert api.reboot_event({**r, "heal_cause": 0, "reset_reason": 1, "why": "power-on"})["severity"] == "advisory"
+
+
+def test_readings_are_labelled_with_the_boot_they_came_from():
+    segs = api.boot_segments(board_health(T0, T0 + 1000, 7, 50) + board_health(T0 + 1190, T0 + 2000, 8, 1, 3, 2))[
+        ("node-rpi-01", "zone_a")]
+    assert api.boot_at(segs, T0 + 500)["boot"] == 7
+    assert api.boot_at(segs, T0 + 1189)["boot"] == 8            # the first second of the new boot
+    assert api.boot_at(segs, T0 - 40)["boot"] == 7              # started 50 s before its first health row
+    assert api.boot_at(segs, T0 - 60) is None                   # before the board started
+
+
+def test_sol_log_report_and_archive_show_board_restarts(mission_env, monkeypatch):
+    fake, clock = mission_env
+    monkeypatch.setattr(api, "write_sol_csvs", lambda m, n, target, real_only=True: os.makedirs(target) or {})
+    client.post("/api/mission/start", json={"name": "Alpha", "start_ist": "2026-09-27 02:48:16"})
+    s3 = T0 + 2 * 86400
+    BOARD.extend(board_health(s3 - 600, s3 + 3600, 25292, 38000)
+                 + board_health(s3 + 3790, s3 + 7200, 25293, 1, reset_reason=3, heal_cause=2))
+    ev = client.get("/api/mission/sol/3").json()["events"]
+    rb = [e for e in ev if e["kind"] == "board.reboot"]
+    assert len(rb) == 1 and "self-heal reboot: Wi-Fi lost (boot 25293, no data for ~200 s)" in rb[0]["message"]
+    token = api.make_token("pratham")
+    assert "self-heal reboot: Wi-Fi lost" in client.get("/api/mission/report/3", params={"dl": token}).text
+    # boot 25292 had been up 38000 s at the start of Sol 3: it powered on during Sol 2, and is shown there
+    rb2 = [e for e in client.get("/api/mission/sol/2").json()["events"] if e["kind"] == "board.reboot"]
+    assert [e["message"] for e in rb2] == ["ESP32 board on node-rpi-01 (zone_a) restarted: power-on (boot 25292)"]
+    target = os.path.join(api.ARCHIVE_DIR, "t")
+    summary = asyncio.run(api.build_sol(asyncio.run(api.mission_or_404()), 3, target))["summary"]
+    assert [r["boot"] for r in summary["reboots"]] == [25293] and summary["reboots"][0]["gap_s"] == 200
+    assert any(e["kind"] == "board.reboot" for e in summary["events"])
+    assert "board_boot" in open(os.path.join(target, "README.txt")).read()
+
+
+def test_sol_csvs_carry_board_boot_and_time_since_boot(monkeypatch, tmp_path):
+    m = M.Mission(id=1, name="Alpha", start=T0, sols=7)
+    BOARD[:] = board_health(T0, T0 + 100, 7, 500) + board_health(T0 + 300, T0 + 400, 8, 2, 3, 2)
+    monkeypatch.setattr(api, "board_rows", lambda start, end, real_only=True: [r for r in BOARD if start <= r["t"] < end])
+    monkeypatch.setattr(api.time, "time", lambda: T0 + 1000)
+
+    def iso(t):
+        return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    def flux_rows(flux):
+        if 'r._field == "q"' in flux:
+            return []
+        sensor = flux.split('r._measurement == "')[1].split('"')[0]
+        zone = "exterior" if sensor == "geiger" else "zone_a"
+        return [{"_time": iso(T0 + t), "node_id": "node-rpi-01", "zone": zone, "temp" if sensor == "bme280" else "cpm": 25.0}
+                for t in (50, 310, 395)]
+
+    class Rec:
+        def __init__(self, v): self.v = v
+        def get_value(self): return self.v
+
+    class Client:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def query_api(self): return self
+        def query(self, q): return [type("T", (), {"records": [Rec("bme280"), Rec("geiger"), Rec("board")]})()]
+    monkeypatch.setattr(api, "_get_client", lambda: Client())
+    monkeypatch.setattr(api, "flux_rows", flux_rows)
+    api.write_sol_csvs(m, 1, str(tmp_path))
+    with open(tmp_path / "bme280.csv") as f:
+        rows = list(csv.DictReader(f))
+    assert [(r["board_boot"], r["since_boot_s"]) for r in rows] == [("7", "550"), ("8", "12"), ("8", "97")]
+    with open(tmp_path / "geiger.csv") as f:
+        assert "board_boot" not in f.readline()                  # the external board has no boot counter

@@ -21,6 +21,7 @@ Numbers are the defaults in imm-os-docs/fdir-strategy.md (FDIR table).
 from typing import Dict, List, Optional
 
 from services.health.alarms import Condition
+from services.telemetry_schema import HEAL_CAUSES, RESET_REASONS  # ESP32 reset reasons, self-heal causes
 
 # measurement → [(severity, direction, limit, deadband)]; direction "hi" raises above, "lo" below
 LIMITS = {
@@ -48,9 +49,6 @@ VITALS = {
 }
 VITAL_LABEL = {"hr_bpm": ("heart rate", "bpm"), "spo2_pct": ("SpO₂", "%"), "skin_temp_c": ("skin temperature", "°C")}
 
-# ESP32 reset reasons (esp_reset_reason_t) worth a word
-RESET_REASONS = {1: "power-on", 3: "software", 4: "crash", 5: "interrupt watchdog", 6: "task watchdog",
-                 7: "watchdog", 9: "brownout (supply dipped)"}
 
 CRITICAL_SOURCES = {"scd40", "o2"}
 
@@ -235,13 +233,13 @@ class Rules:
     def _board_rules(self, c, s, now):
         k = s.key
         last = self._board_last.get(k.id(), {})
-        cur = {m: s.last.get(m) for m in ("bme_resets", "boot_count", "reset_reason", "i2c_err")}
+        cur = {m: s.last.get(m) for m in ("bme_resets", "boot_count", "reset_reason", "i2c_err", "heal_cause")}
         ev = self._board_events.setdefault(k.id(), [])
         if last:
             if cur["bme_resets"] is not None and last.get("bme_resets") is not None and cur["bme_resets"] > last["bme_resets"]:
                 ev.append((now, "bme", cur["bme_resets"] - last["bme_resets"]))
             if cur["boot_count"] is not None and last.get("boot_count") is not None and cur["boot_count"] > last["boot_count"]:
-                ev.append((now, "boot", int(cur["reset_reason"] or 0)))
+                ev.append((now, "boot", int(cur["reset_reason"] or 0), int(cur["heal_cause"] or 0)))
         self._board_last[k.id()] = cur
         ev[:] = [e for e in ev if now - e[0] <= 900]
         bme = int(sum(e[2] for e in ev if e[1] == "bme"))
@@ -251,9 +249,11 @@ class Rules:
                 f"ESP32 board on {k.node}: BME280 lost power {bme} times in 15 min: check the board's supply and the BME280's VIN/GND")
         boots = [e for e in ev if e[1] == "boot"]
         if boots:
-            why = RESET_REASONS.get(boots[-1][2], f"reason {boots[-1][2]}")
+            _, _, reason, heal = boots[-1]
+            why = (f"self-heal reboot: {HEAL_CAUSES.get(heal, f'cause {heal}')}" if heal
+                   else RESET_REASONS.get(reason, f"reason {reason}"))
             c[f"board.{k.node}.{k.zone}.reboot"] = Condition(
-                "caution" if boots[-1][2] in (4, 5, 6, 7, 9) else "advisory", "node", k.id(),
+                "caution" if heal or reason in (4, 5, 6, 7, 9) else "advisory", "node", k.id(),
                 f"ESP32 board on {k.node} restarted ({why}), {len(boots)} time(s) in 15 min")
 
     # ── MCC services ───────────────────────────────────────────────

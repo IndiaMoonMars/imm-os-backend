@@ -56,6 +56,7 @@ from services import mission as M
 from services.auth import COMMANDER, MCC_OPERATOR, User, authenticated, crew_or_edge, current_user, require_roles
 from services.health.streams import DEFAULT_PERIOD_S
 from services.telemetry_api import PIPELINE_BUCKET, _get_client
+from services.telemetry_schema import HEAL_CAUSES, RESET_REASONS
 
 log = logging.getLogger("mission")
 
@@ -635,7 +636,7 @@ async def sol_detail(n: int, sim: bool = False, mission: Optional[int] = None):
         raise HTTPException(404, f"no Sol {n} in this mission")
     values, counts = await sol_rollup(m, n, not sim, now)
     s = M.summary(m, n, values, counts, now, periods())
-    s["events"] = await store.events(m.id, s["start"] - (3600 if n == 1 else 0), s["end"])
+    s["events"] = await mission_log(m, s["start"] - (3600 if n == 1 else 0), s["end"], not sim)
     series = {}
     for key, *_rest in M.MEASUREMENTS:
         src = s["measurements"][key]["source"]
@@ -735,6 +736,98 @@ def _q_by_time(sensor: str, start: float, end: float, real_only: bool) -> Dict[t
     return {(r["_time"], r.get("node_id"), r.get("zone")): r.get("_value") for r in flux_rows(flux)}
 
 
+# ── ESP32 board restarts: when, why, and which readings came from which boot ──
+
+ESP32_SENSORS = {"bme280", "scd40", "bno055", "o2", "mq4", "board"}     # what the ESP32 sensor board reports
+BOOT_LOOKBACK_S = 3600                    # see the boot before a window's first restart (for its data gap)
+
+
+def board_rows(start: float, end: float, real_only: bool = True) -> List[dict]:
+    """Blocking: the boards' health rows (boot_count, uptime_s, reset_reason, heal_cause) in [start, end)."""
+    sim = 'r.simulated == "false" and ' if real_only else ""
+    flux = (f'from(bucket: "{PIPELINE_BUCKET}") |> range(start: {_iso(start)}, stop: {_iso(end)}) '
+            f'|> filter(fn: (r) => {sim}r._measurement == "board" and r._field == "value" and '
+            f'(r.metric == "boot_count" or r.metric == "uptime_s" or r.metric == "reset_reason" or r.metric == "heal_cause")) '
+            f'|> keep(columns: ["_time", "_value", "metric", "node_id", "zone"]) '
+            f'|> group(columns: ["node_id", "zone"]) '
+            f'|> pivot(rowKey: ["_time"], columnKey: ["metric"], valueColumn: "_value")')
+    return [{**r, "t": _epoch(r["_time"])} for r in flux_rows(flux)]
+
+
+def boot_segments(rows: List[dict]) -> Dict[Tuple[str, str], List[dict]]:
+    """Board-health rows → each (node, zone)'s boots, oldest first. A boot began at
+    time - uptime (to ~1 s); first / last are its first and last health rows (every 10 s)."""
+    out: Dict[Tuple[str, str], List[dict]] = {}
+    for r in sorted(rows, key=lambda r: r["t"]):
+        if r.get("boot_count") is None or r.get("uptime_s") is None:
+            continue                                     # a board without boot counting (the external one)
+        segs = out.setdefault((r.get("node_id"), r.get("zone")), [])
+        boot, began = int(r["boot_count"]), r["t"] - float(r["uptime_s"])
+        if segs and segs[-1]["boot"] == boot:
+            segs[-1]["start"] = min(segs[-1]["start"], began)
+            segs[-1]["last"] = r["t"]
+        else:
+            segs.append({"boot": boot, "start": began, "first": r["t"], "last": r["t"],
+                         "reset_reason": int(r.get("reset_reason") or 0), "heal_cause": int(r.get("heal_cause") or 0)})
+    return out
+
+
+def restart_why(reset_reason: int, heal_cause: int) -> str:
+    if heal_cause:
+        return f"self-heal reboot: {HEAL_CAUSES.get(heal_cause, f'cause {heal_cause}')}"
+    return RESET_REASONS.get(reset_reason, f"reset reason {reset_reason}")
+
+
+def board_reboots(segments: Dict[Tuple[str, str], List[dict]], start: float, end: float) -> List[dict]:
+    """Every board (re)start that began in [start, end): when, why, and the data gap it left."""
+    out = []
+    for (node, zone), segs in segments.items():
+        for i, seg in enumerate(segs):
+            if not start <= seg["start"] < end:
+                continue
+            prev = segs[i - 1] if i else None
+            out.append({"at": seg["start"], "at_ist": M.ist(seg["start"]), "node_id": node, "zone": zone,
+                        "boot": seg["boot"], "reset_reason": seg["reset_reason"], "heal_cause": seg["heal_cause"],
+                        "why": restart_why(seg["reset_reason"], seg["heal_cause"]),
+                        "last_heard": prev["last"] if prev else None,
+                        "gap_s": round(seg["first"] - prev["last"]) if prev else None})
+    return sorted(out, key=lambda r: r["at"])
+
+
+def boot_at(segs: List[dict], ts: float) -> Optional[dict]:
+    """The boot a reading at ts came from: the latest one that had started by then."""
+    found = None
+    for seg in segs:
+        if seg["start"] <= ts + 1:              # boot start is known to ~1 s
+            found = seg
+        else:
+            break
+    return found
+
+
+def reboot_event(r: dict) -> dict:
+    gap = f", no data for ~{r['gap_s']} s" if r.get("gap_s") is not None else ""
+    return {"at": r["at"], "kind": "board.reboot", "severity": "caution" if r["heal_cause"] or r["reset_reason"] in (4, 5, 6, 7, 9)
+            else "advisory", "actor": None,
+            "message": f"ESP32 board on {r['node_id']} ({r['zone']}) restarted: {r['why']} (boot {r['boot']}{gap})"}
+
+
+async def sol_reboots(start: float, end: float, real_only: bool = True) -> List[dict]:
+    try:
+        rows = await asyncio.to_thread(board_rows, start - BOOT_LOOKBACK_S, end, real_only)
+    except Exception as e:                       # InfluxDB unreachable: the log still works without them
+        log.warning("board restarts not available: %s", e)
+        return []
+    return board_reboots(boot_segments(rows), start, end)
+
+
+async def mission_log(m: M.Mission, start: float, end: float, real_only: bool = True) -> List[dict]:
+    """The mission log with the boards' restarts in it, newest first."""
+    events = await store.events(m.id, start, end)
+    events += [reboot_event(r) for r in await sol_reboots(start, end, real_only)]
+    return sorted(events, key=lambda e: -e["at"])
+
+
 def write_sol_csvs(m: M.Mission, n: int, target: str, real_only: bool = True) -> Dict[str, int]:
     """Blocking: every reading of the sol, one CSV per sensor (wide: a column per metric). → rows per file."""
     s, e = M.sol_bounds(m, n)
@@ -746,6 +839,7 @@ def write_sol_csvs(m: M.Mission, n: int, target: str, real_only: bool = True) ->
         sensors = [r.get_value() for t in client.query_api().query(
             f'import "influxdata/influxdb/schema"\nschema.measurements(bucket: "{PIPELINE_BUCKET}", '
             f'start: {_iso(s)}, stop: {_iso(end)})') for r in t.records]
+    boots = boot_segments(board_rows(s - BOOT_LOOKBACK_S, end, real_only)) if "board" in sensors else {}
     for sensor in sorted(x for x in sensors if x != "anomaly"):
         q = _q_by_time(sensor, s, end, real_only)
         flux = (f'from(bucket: "{PIPELINE_BUCKET}") |> range(start: {_iso(s)}, stop: {_iso(end)}) '
@@ -758,17 +852,25 @@ def write_sol_csvs(m: M.Mission, n: int, target: str, real_only: bool = True) ->
             continue
         metrics = sorted({k for r in rows for k in r if not k.startswith("_") and k not in
                           ("result", "table", "node_id", "zone")})
+        # ESP32 board readings: which boot of the board each came from, and how long after it started
+        # (rows with a new board_boot follow a restart; summary.json "reboots" says when and why)
+        labelled = sensor in ESP32_SENSORS and any(boots.get((r.get("node_id"), r.get("zone"))) for r in rows)
         path = os.path.join(target, f"{sensor}.csv")
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["time_ist", "time_utc", "sol", "node_id", "zone", *metrics, "quality"])
+            w.writerow(["time_ist", "time_utc", "sol", "node_id", "zone", *metrics, "quality",
+                        *(["board_boot", "since_boot_s"] if labelled else [])])
             for r in rows:
                 ts = _epoch(r["_time"])
-                w.writerow([M.ist(ts, "%Y-%m-%d %H:%M:%S.%f")[:-3],
-                            datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
-                            n, r.get("node_id"), r.get("zone"),
-                            *["" if r.get(k) is None else r.get(k) for k in metrics],
-                            q.get((r["_time"], r.get("node_id"), r.get("zone")), "")])
+                row = [M.ist(ts, "%Y-%m-%d %H:%M:%S.%f")[:-3],
+                       datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+                       n, r.get("node_id"), r.get("zone"),
+                       *["" if r.get(k) is None else r.get(k) for k in metrics],
+                       q.get((r["_time"], r.get("node_id"), r.get("zone")), "")]
+                if labelled:
+                    seg = boot_at(boots.get((r.get("node_id"), r.get("zone"))) or [], ts)
+                    row += [seg["boot"], round(ts - seg["start"])] if seg else ["", ""]
+                w.writerow(row)
         written[f"{sensor}.csv"] = len(rows)
     return written
 
@@ -786,7 +888,11 @@ def _readme(m: M.Mission, n: int) -> str:
     return (f"{m.name} · Sol {n}\n{M.ist(s)} → {M.ist(e)}\n\n"
             "One CSV per sensor: time in IST and UTC, the node and zone, one column per metric, and the\n"
             "reading's quality (good / suspect / bad; suspect includes warm-up). summary.json holds the sol's\n"
-            "statistics (good readings only), data coverage and the mission log; SHA256SUMS the checksums.\n")
+            "statistics (good readings only), data coverage and the mission log; SHA256SUMS the checksums.\n\n"
+            "ESP32 sensor-board files (bme280, o2, bno055, mq4, scd40, board) also have board_boot (which\n"
+            "start of the board a reading came from: it changes after every restart) and since_boot_s.\n"
+            "summary.json \"reboots\" lists each restart: when (at_ist), why (power-on, RESET button,\n"
+            "brownout, watchdog, or the firmware's own self-heal reboot and its cause) and the data gap.\n")
 
 
 async def build_sol(m: M.Mission, n: int, target: str, real_only: bool = True) -> dict:
@@ -796,10 +902,12 @@ async def build_sol(m: M.Mission, n: int, target: str, real_only: bool = True) -
     values, counts = await sol_rollup(m, n, real_only, now)
     summary = M.summary(m, n, values, counts, now, periods())
     summary["mission"] = m.to_json()
+    summary["reboots"] = await sol_reboots(summary["start"], summary["end"], real_only)
     try:
-        summary["events"] = await store.events(m.id, summary["start"], summary["end"])
+        summary["events"] = sorted(await store.events(m.id, summary["start"], summary["end"])
+                                   + [reboot_event(r) for r in summary["reboots"]], key=lambda e: -e["at"])
     except HTTPException:
-        summary["events"] = []
+        summary["events"] = [reboot_event(r) for r in reversed(summary["reboots"])]
     with open(os.path.join(target, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1, default=str)
     with open(os.path.join(target, "rollup.json"), "w") as f:
@@ -946,7 +1054,7 @@ async def sol_report(n: int, sim: bool = False, mission: Optional[int] = None, w
     now = time.time()
     values, counts = await sol_rollup(m, n, not sim, now)
     s = M.summary(m, n, values, counts, now, periods())
-    s["events"] = await store.events(m.id, s["start"], s["end"])
+    s["events"] = await mission_log(m, s["start"], s["end"], not sim)
     return HTMLResponse(report_html(m, s))
 
 
