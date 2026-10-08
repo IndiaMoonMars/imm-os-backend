@@ -10,7 +10,7 @@ Features:
   - Workout log + weekly compliance report
   - Flight surgeon role-gated crew overview
 """
-from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Any
@@ -18,6 +18,11 @@ import asyncpg, os, math, json, httpx
 from datetime import datetime, date, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import numpy as np
+
+from services.auth import (
+    COMMANDER, FLIGHT_SURGEON, User, current_user, ensure_self_or_roles,
+    require_roles, service_headers,
+)
 
 app = FastAPI(title="IMM Medical API", version="1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -330,7 +335,7 @@ async def check_expiry_alerts():
                         "recipient_group": "mcc",
                         "subject": "Supply Expiry Warning",
                         "body": body
-                    }, timeout=10)
+                    }, headers=service_headers(), timeout=10)
             except Exception:
                 pass
 
@@ -353,7 +358,7 @@ async def weekly_compliance_report():
                         "recipient_group": "mcc",
                         "subject": f"Weekly Exercise Report — {cid}",
                         "body": body
-                    }, timeout=10)
+                    }, headers=service_headers(), timeout=10)
             except Exception:
                 pass
 
@@ -416,7 +421,8 @@ async def health(): return {"status": "ok", "service": "medical-api"}
 
 # ─── MEDICAL READINGS ─────────────────────────────────────────────────────────
 @app.post("/api/v1/medical/reading")
-async def post_reading(body: ReadingIn):
+async def post_reading(body: ReadingIn, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, body.crew_id, FLIGHT_SURGEON)
     ecg_result = None
     if body.ecg_samples and body.reading_type == "ecg":
         ecg_result = pan_tompkins_hr(body.ecg_samples)
@@ -438,31 +444,26 @@ async def post_reading(body: ReadingIn):
     return resp
 
 @app.get("/api/v1/medical/readings/{crew_id}")
-async def get_readings(crew_id: str, requester_id: str = Query(...), limit: int = 50):
+async def get_readings(crew_id: str, limit: int = 50, user: User = Depends(current_user)):
     """Flight surgeon sees all. Crew only sees own."""
+    ensure_self_or_roles(user, crew_id, FLIGHT_SURGEON)
     async with pool.acquire() as conn:
-        role = await conn.fetchval("SELECT role FROM users WHERE username=$1", requester_id)
-        if role != "flight_surgeon" and requester_id != crew_id:
-            raise HTTPException(403, "Access denied — medical data is private")
         rows = await conn.fetch(
             "SELECT * FROM medical_readings WHERE crew_id=$1 ORDER BY recorded_at DESC LIMIT $2",
             crew_id, limit
         )
     return [dict(r) for r in rows]
 
-@app.get("/api/v1/medical/all-crew")
-async def all_crew_readings(requester_id: str = Query(...)):
+@app.get("/api/v1/medical/all-crew", dependencies=[Depends(require_roles(FLIGHT_SURGEON))])
+async def all_crew_readings():
     async with pool.acquire() as conn:
-        role = await conn.fetchval("SELECT role FROM users WHERE username=$1", requester_id)
-        if role != "flight_surgeon":
-            raise HTTPException(403, "Flight surgeon access only")
         rows = await conn.fetch(
             "SELECT crew_id, reading_type, value, unit, recorded_at FROM medical_readings ORDER BY recorded_at DESC LIMIT 200"
         )
     return [dict(r) for r in rows]
 
 # ─── FOOD LOG ─────────────────────────────────────────────────────────────────
-@app.get("/api/v1/medical/foods")
+@app.get("/api/v1/medical/foods", dependencies=[Depends(current_user)])
 async def list_foods(q: str = ""):
     async with pool.acquire() as conn:
         if q:
@@ -474,7 +475,8 @@ async def list_foods(q: str = ""):
     return [dict(r) for r in rows]
 
 @app.post("/api/v1/medical/food-log")
-async def log_food(body: FoodLogIn):
+async def log_food(body: FoodLogIn, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, body.crew_id, FLIGHT_SURGEON)
     # If food_item_id provided, pull macros from DB and scale by quantity_g
     async with pool.acquire() as conn:
         if body.food_item_id:
@@ -497,7 +499,8 @@ async def log_food(body: FoodLogIn):
             "carb_g": body.carb_g, "fat_g": body.fat_g}
 
 @app.get("/api/v1/medical/food-log/{crew_id}")
-async def get_food_log(crew_id: str, day: Optional[int] = None):
+async def get_food_log(crew_id: str, day: Optional[int] = None, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, crew_id, FLIGHT_SURGEON)
     async with pool.acquire() as conn:
         if day:
             rows = await conn.fetch(
@@ -517,7 +520,8 @@ async def get_food_log(crew_id: str, day: Optional[int] = None):
 
 # ─── MEDICATION ───────────────────────────────────────────────────────────────
 @app.post("/api/v1/medical/medication")
-async def add_medication(body: MedIn):
+async def add_medication(body: MedIn, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, body.crew_id, FLIGHT_SURGEON)
     async with pool.acquire() as conn:
         expiry = date.fromisoformat(body.expiry_date) if body.expiry_date else None
         mid = await conn.fetchval(
@@ -530,7 +534,8 @@ async def add_medication(body: MedIn):
     return {"med_id": mid}
 
 @app.get("/api/v1/medical/medications/{crew_id}")
-async def get_medications(crew_id: str):
+async def get_medications(crew_id: str, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, crew_id, FLIGHT_SURGEON)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT * FROM medication_log WHERE crew_id=$1 ORDER BY created_at DESC", crew_id
@@ -547,15 +552,19 @@ async def get_medications(crew_id: str):
     return result
 
 @app.patch("/api/v1/medical/medication/{med_id}/taken")
-async def log_dose_taken(med_id: int):
+async def log_dose_taken(med_id: int, user: User = Depends(current_user)):
     async with pool.acquire() as conn:
+        owner = await conn.fetchval("SELECT crew_id FROM medication_log WHERE id=$1", med_id)
+        if owner is None:
+            raise HTTPException(404, "Medication not found")
+        ensure_self_or_roles(user, owner, FLIGHT_SURGEON)
         await conn.execute(
             "UPDATE medication_log SET last_taken_at=NOW(), stock_count=GREATEST(0,stock_count-1) WHERE id=$1", med_id
         )
     return {"status": "dose_recorded"}
 
 # ─── FOOD STOCK ───────────────────────────────────────────────────────────────
-@app.post("/api/v1/medical/food-stock")
+@app.post("/api/v1/medical/food-stock", dependencies=[Depends(current_user)])
 async def add_food_stock(body: FoodStockIn):
     async with pool.acquire() as conn:
         expiry = date.fromisoformat(body.expiry_date) if body.expiry_date else None
@@ -565,7 +574,7 @@ async def add_food_stock(body: FoodStockIn):
         )
     return {"stock_id": sid}
 
-@app.get("/api/v1/medical/food-stock")
+@app.get("/api/v1/medical/food-stock", dependencies=[Depends(current_user)])
 async def get_food_stock():
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT *, (expiry_date - CURRENT_DATE) as days_left FROM food_stock ORDER BY expiry_date")
@@ -578,13 +587,13 @@ async def get_food_stock():
     return result
 
 # ─── QUESTIONNAIRES ───────────────────────────────────────────────────────────
-@app.get("/api/v1/medical/questionnaires")
+@app.get("/api/v1/medical/questionnaires", dependencies=[Depends(current_user)])
 async def list_questionnaires():
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT id, name, description FROM questionnaire_templates")
     return [dict(r) for r in rows]
 
-@app.get("/api/v1/medical/questionnaire/{template_id}")
+@app.get("/api/v1/medical/questionnaire/{template_id}", dependencies=[Depends(current_user)])
 async def get_questionnaire(template_id: int):
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM questionnaire_templates WHERE id=$1", template_id)
@@ -593,7 +602,8 @@ async def get_questionnaire(template_id: int):
     return dict(row)
 
 @app.post("/api/v1/medical/questionnaire/submit")
-async def submit_questionnaire(body: QuestionnaireResponseIn):
+async def submit_questionnaire(body: QuestionnaireResponseIn, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, body.crew_id)
     async with pool.acquire() as conn:
         tmpl = await conn.fetchrow("SELECT * FROM questionnaire_templates WHERE id=$1", body.template_id)
         if not tmpl:
@@ -621,7 +631,8 @@ async def submit_questionnaire(body: QuestionnaireResponseIn):
     return {"response_id": rid, "total_score": round(score, 2), "flagged": bool(flagged)}
 
 @app.get("/api/v1/medical/questionnaire/history/{crew_id}")
-async def questionnaire_history(crew_id: str):
+async def questionnaire_history(crew_id: str, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, crew_id, FLIGHT_SURGEON)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT qr.*, qt.name FROM questionnaire_responses qr
@@ -632,7 +643,8 @@ async def questionnaire_history(crew_id: str):
 
 # ─── WORKOUT LOG ──────────────────────────────────────────────────────────────
 @app.post("/api/v1/medical/workout")
-async def log_workout(body: WorkoutIn):
+async def log_workout(body: WorkoutIn, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, body.crew_id, FLIGHT_SURGEON)
     async with pool.acquire() as conn:
         wid = await conn.fetchval(
             """INSERT INTO workout_log(crew_id, exercise_type, duration_min, intensity,
@@ -645,7 +657,8 @@ async def log_workout(body: WorkoutIn):
     return {"workout_id": wid}
 
 @app.get("/api/v1/medical/workouts/{crew_id}")
-async def get_workouts(crew_id: str, weeks: int = 4):
+async def get_workouts(crew_id: str, weeks: int = 4, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, crew_id, FLIGHT_SURGEON)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT * FROM workout_log WHERE crew_id=$1 ORDER BY started_at DESC LIMIT $2",
@@ -664,7 +677,8 @@ async def get_workouts(crew_id: str, weeks: int = 4):
     }
 
 @app.get("/api/v1/medical/week-report/{crew_id}")
-async def week_report(crew_id: str):
+async def week_report(crew_id: str, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, crew_id, FLIGHT_SURGEON)
     async with pool.acquire() as conn:
         week_ago = datetime.now(IST) - timedelta(days=7)
         workouts = await conn.fetch(
@@ -690,7 +704,7 @@ async def week_report(crew_id: str):
     }
 
 # ─── Trigger expiry check manually ────────────────────────────────────────────
-@app.post("/api/v1/medical/trigger-expiry-check")
+@app.post("/api/v1/medical/trigger-expiry-check", dependencies=[Depends(require_roles(FLIGHT_SURGEON, COMMANDER))])
 async def trigger_expiry():
     await check_expiry_alerts()
     return {"status": "expiry_check_dispatched"}

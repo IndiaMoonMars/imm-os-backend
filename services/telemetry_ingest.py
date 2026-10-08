@@ -8,20 +8,23 @@ IMM-OS Telemetry API Server
 """
 
 import os
+import re
 import json
 import logging
 import asyncio
 import threading
 from typing import Optional, List
-from enum import Enum
 from datetime import datetime, timezone, timedelta
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel
 from confluent_kafka import Producer, Consumer, KafkaException, KafkaError
 from influxdb_client import InfluxDBClient
 import asyncpg
+
+from services.auth import IMM_ROLES, User, current_user, edge_device, user_from_token
+from services.telemetry_schema import SENSOR_METRICS, InvalidTelemetry, normalise
 
 ist_tz = timezone(timedelta(hours=5, minutes=30))
 logging.Formatter.converter = lambda *args: datetime.now(ist_tz).timetuple()
@@ -30,6 +33,7 @@ log = logging.getLogger(__name__)
 
 KAFKA_BOOTSTRAP   = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 VALIDATED_TOPIC   = "telemetry.validated"
+HEALTH_TOPIC      = "health.events"      # the health monitor's alarms, EVA LOS and mode changes
 INFLUX_URL        = os.getenv("INFLUX_URL", "http://localhost:8086")
 INFLUX_TOKEN      = os.getenv("INFLUX_TOKEN", "imm-super-secret-token")
 INFLUX_ORG        = os.getenv("INFLUX_ORG", "imm_org")
@@ -40,67 +44,41 @@ producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP, "acks": "all"})
 app = FastAPI(title="IMM-OS Telemetry Server", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_headers=["*"], allow_methods=["*"])
 
-# ── Pydantic sensor schemas ────────────────────────────────────────
-
-class SensorType(str, Enum):
-    bme280   = "bme280"
-    scd40    = "scd40"
-    mq7      = "mq7"
-    max30100 = "max30100"
-    ecg_ad8232 = "ecg_ad8232"
-    tsl2561  = "tsl2561"
-    ina219   = "ina219"
-
-class TelemetryPayload(BaseModel):
-    sensor:    SensorType
-    timestamp: int = Field(..., gt=0)
-    sig:       Optional[str] = None
-    # Data fields
-    temp:      Optional[float] = None
-    hum:       Optional[float] = None
-    pres:      Optional[float] = None
-    co2_ppm:   Optional[float] = None
-    co_ppm:    Optional[float] = None
-    hr_bpm:    Optional[float] = None
-    spo2_pct:  Optional[float] = None
-    voltage:   Optional[float] = None
-    lux:       Optional[float] = None
-    zone:      Optional[str]   = None
-    voltage_v: Optional[float] = None
-    current_ma:Optional[float] = None
-    power_mw:  Optional[float] = None
-
-    @validator("timestamp")
-    def timestamp_reasonable(cls, v):
-        import time
-        now = int(time.time())
-        if abs(v - now) > 86400 * 7:
-            raise ValueError("Timestamp too far from current time")
-        return v
+# ── Sensor schema: shared with the validator (services/telemetry_schema.py) ──
 
 class CommandReq(BaseModel):
-    operator_id: str
     command_text: str
+    operator_id: Optional[str] = None  # ignored; the operator is the logged-in user
 
 # ── Live Broadcast WebSockets ──────────────────────────────────────
 
 class ConnectionManager:
+    """
+    Telemetry frames go to every socket. Health events (alarms, EVA LOS, mode) go only
+    to sockets opened with ?health=1, wrapped as {"channel": "health", "event": {...}},
+    so clients that only know telemetry frames never see them.
+    """
     def __init__(self):
         self.active_connections: List[WebSocket] = []
+        self.health: set = set()
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
+    def register(self, websocket: WebSocket, health: bool = False):
         self.active_connections.append(websocket)
+        if health:
+            self.health.add(websocket)
 
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
+        self.health.discard(websocket)
 
-    async def broadcast(self, message: str):
+    async def broadcast(self, message: str, health: bool = False):
         for connection in list(self.active_connections):
+            if health and connection not in self.health:
+                continue
             try:
                 await connection.send_text(message)
-            except WebSocketDisconnect:
+            except Exception:           # closed mid-send: drop it, keep serving the rest
                 self.disconnect(connection)
 
 manager = ConnectionManager()
@@ -110,19 +88,23 @@ def kafka_ws_consumer_loop(loop):
     consumer = Consumer({
         "bootstrap.servers": KAFKA_BOOTSTRAP,
         "group.id": "openmct_ws_broadcaster",
+        "topic.metadata.refresh.interval.ms": 10000,  # topics may be created after start-up
         "auto.offset.reset": "latest",
     })
-    consumer.subscribe([VALIDATED_TOPIC])
+    consumer.subscribe([VALIDATED_TOPIC, HEALTH_TOPIC])
     log.info("WS Broadcaster attached to Kafka stream.")
-    
+
     while True:
         msg = consumer.poll(1.0)
         if msg is None: continue
         if msg.error(): continue
-        
+
         raw_val = msg.value().decode('utf-8')
-        # Push to WS loop
-        asyncio.run_coroutine_threadsafe(manager.broadcast(raw_val), loop)
+        if msg.topic() == HEALTH_TOPIC:
+            raw_val = '{"channel": "health", "event": ' + raw_val + '}'
+            asyncio.run_coroutine_threadsafe(manager.broadcast(raw_val, health=True), loop)
+        else:
+            asyncio.run_coroutine_threadsafe(manager.broadcast(raw_val), loop)
 
 @app.on_event("startup")
 async def startup_event():
@@ -135,25 +117,24 @@ async def startup_event():
 def health():
     return {"status": "ok"}
 
-@app.post("/ingest", status_code=202)
+@app.post("/ingest", status_code=202, dependencies=[Depends(edge_device)])
 async def ingest(request: Request):
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=422, detail="Invalid JSON body")
 
-    payload_data = body.get("data", body)
     try:
-        payload = TelemetryPayload(**payload_data)
-    except Exception as e:
+        reading = normalise(body)
+    except InvalidTelemetry as e:
         raise HTTPException(status_code=422, detail=str(e))
-        
-    envelope = {"data": payload.dict(), "sig": body.get("sig")}
+
+    envelope = {"data": reading, "sig": reading.pop("sig", None)}
 
     try:
         producer.produce(
             VALIDATED_TOPIC,
-            key=payload.sensor.encode(),
+            key=reading["sensor"].encode(),
             value=json.dumps(envelope).encode(),
         )
         producer.poll(0)
@@ -161,10 +142,16 @@ async def ingest(request: Request):
         log.error("Kafka produce error: %s", e)
         raise HTTPException(status_code=503, detail="Kafka unavailable")
 
-    return {"accepted": True, "sensor": payload.sensor}
+    return {"accepted": True, "sensor": reading["sensor"]}
 
-@app.get("/history")
+@app.get("/history", dependencies=[Depends(current_user)])
 def get_history(start: int, end: int, sensor: str, metric: str, zone: str = None):
+    """History for one sensor metric; start/end are Unix seconds."""
+    # values go into the Flux query text, so only accept known names
+    if metric not in SENSOR_METRICS.get(sensor, []):
+        raise HTTPException(status_code=422, detail=f"Unknown sensor metric {sensor}.{metric}")
+    if zone is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", zone):
+        raise HTTPException(status_code=422, detail="Invalid zone")
     client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
     query_api = client.query_api()
 
@@ -198,7 +185,7 @@ def get_history(start: int, end: int, sensor: str, metric: str, zone: str = None
 
     return results
 
-@app.get("/alerts")
+@app.get("/alerts", dependencies=[Depends(current_user)])
 def get_alerts(since: int):
     client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
     query_api = client.query_api()
@@ -228,7 +215,7 @@ def get_alerts(since: int):
     return results
 
 @app.post("/commands", status_code=201)
-async def log_command(req: CommandReq):
+async def log_command(req: CommandReq, user: User = Depends(current_user)):
     try:
         conn = await asyncpg.connect(
             user=os.getenv("POSTGRES_USER", "admin"),
@@ -238,18 +225,46 @@ async def log_command(req: CommandReq):
         )
         await conn.execute(
             "INSERT INTO command_history (operator_id, command_text) VALUES ($1, $2)",
-            req.operator_id, req.command_text
+            user.username, req.command_text
         )
         await conn.close()
-        log.info(f"Command stored: {req.operator_id} -> {req.command_text}")
+        log.info(f"Command stored: {user.username} -> {req.command_text}")
         return {"logged": True}
     except Exception as e:
         log.error(f"Postgres insert failed: {e}")
         raise HTTPException(status_code=500, detail="Database failure")
 
+WS_AUTH_TIMEOUT_S = 5
+
+
+async def authenticate_websocket(websocket: WebSocket) -> Optional[User]:
+    """
+    Browsers can't set headers on WebSocket requests, and tokens in URLs end up
+    in proxy logs, so the client sends {"type": "auth", "token": "<jwt>"} as its
+    first message. Returns the user, or None after closing the socket (4401).
+    """
+    try:
+        msg = json.loads(await asyncio.wait_for(websocket.receive_text(), WS_AUTH_TIMEOUT_S))
+        if msg.get("type") != "auth":
+            raise ValueError("first message must be auth")
+        user = user_from_token(str(msg.get("token", "")))
+        if not user.roles & IMM_ROLES:
+            raise ValueError("no IMM-OS role")
+        return user
+    except WebSocketDisconnect:
+        return None
+    except (asyncio.TimeoutError, ValueError, HTTPException, AttributeError, TypeError):
+        await websocket.close(code=4401, reason="Unauthorized")
+        return None
+
+
 @app.websocket("/realtime")
 async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+    await websocket.accept()
+    user = await authenticate_websocket(websocket)
+    if user is None:
+        return
+    manager.register(websocket, health=websocket.query_params.get("health") == "1")
     try:
         while True:
             # heartbeat or client-sent filters

@@ -9,13 +9,18 @@ Features:
   - Sleep deprivation alert: <6h for ≥3 consecutive nights → flight surgeon push
   - 30-day trend endpoints for Flight Surgeon dashboard
 """
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 import asyncpg, os, json, httpx
 from datetime import datetime, date, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from services.auth import (
+    COMMANDER, FLIGHT_SURGEON, User, current_user, ensure_self_or_roles,
+    require_roles, require_shared_secret, service_headers,
+)
 
 app = FastAPI(title="IMM Psychology API", version="1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -141,7 +146,7 @@ async def mood_push_notification(period: str):
                 "recipient_group": "astro",
                 "subject": f"{'🌅 Morning' if period == 'morning' else '🌙 Evening'} Mood Check-In",
                 "body": f"Please complete your {period} mood check-in in the IMM-OS Psych tab. This takes only 30 seconds."
-            }, timeout=5)
+            }, headers=service_headers(), timeout=5)
     except Exception:
         pass
 
@@ -165,7 +170,7 @@ async def check_sleep_deprivation():
                             "body": f"Crew member {cid} has slept <6 hours for 3 consecutive nights.\n"
                                     f"Sleep durations: {hours[2]}h, {hours[1]}h, {hours[0]}h\n"
                                     f"Recommendation: Review duty schedule, prescribe forced rest period."
-                        }, timeout=10)
+                        }, headers=service_headers(), timeout=10)
                 except Exception:
                     pass
 
@@ -183,7 +188,7 @@ async def send_survey_reminders():
                             "recipient_group": "astro",
                             "subject": f"📋 Weekly Survey: {tmpl['name']}",
                             "body": f"Your {tmpl['name']} psychological survey is due today. Please complete it in the IMM-OS Psych tab."
-                        }, timeout=5)
+                        }, headers=service_headers(), timeout=5)
                 except Exception:
                     pass
 
@@ -221,7 +226,8 @@ async def health(): return {"status": "ok", "service": "psych-api"}
 
 # ─── SLEEP LOG ────────────────────────────────────────────────────────────────
 @app.post("/api/v1/psych/sleep")
-async def log_sleep(body: SleepIn):
+async def log_sleep(body: SleepIn, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, body.crew_id)
     onset = datetime.fromisoformat(body.sleep_onset)
     wake  = datetime.fromisoformat(body.wake_time)
     duration_min = max(0, int((wake - onset).total_seconds() / 60))
@@ -236,14 +242,17 @@ async def log_sleep(body: SleepIn):
     return {"sleep_id": sid, "duration_min": duration_min, "duration_h": round(duration_min/60, 2)}
 
 @app.get("/api/v1/psych/sleep/{crew_id}")
-async def get_sleep(crew_id: str, days: int = 30):
+async def get_sleep(crew_id: str, days: int = 30, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, crew_id, FLIGHT_SURGEON)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT * FROM sleep_log WHERE crew_id=$1 ORDER BY mission_day DESC LIMIT $2",
             crew_id, days
         )
         avg_dur = await conn.fetchval(
-            "SELECT AVG(duration_min) FROM sleep_log WHERE crew_id=$1 ORDER BY mission_day DESC LIMIT 7", crew_id
+            """SELECT AVG(duration_min) FROM (
+                   SELECT duration_min FROM sleep_log WHERE crew_id=$1
+                   ORDER BY mission_day DESC LIMIT 7) recent""", crew_id
         )
     return {
         "entries": [dict(r) for r in rows],
@@ -251,7 +260,7 @@ async def get_sleep(crew_id: str, days: int = 30):
     }
 
 # Garmin/Fitbit webhook-compatible ingest
-@app.post("/api/v1/psych/sleep/webhook")
+@app.post("/api/v1/psych/sleep/webhook", dependencies=[Depends(require_shared_secret("SLEEP_WEBHOOK_TOKEN"))])
 async def sleep_webhook(payload: dict):
     """Accept Garmin Connect IQ or Fitbit sleep webhook. Parse and store."""
     # Fitbit format: payload["sleep"][0]
@@ -282,7 +291,8 @@ async def sleep_webhook(payload: dict):
 
 # ─── MOOD CHECK-IN ────────────────────────────────────────────────────────────
 @app.post("/api/v1/psych/mood")
-async def log_mood(body: MoodIn):
+async def log_mood(body: MoodIn, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, body.crew_id)
     if body.score < 1 or body.score > 5:
         raise HTTPException(400, "Score must be 1–5")
     async with pool.acquire() as conn:
@@ -293,7 +303,8 @@ async def log_mood(body: MoodIn):
     return {"checkin_id": mid, "mission_day": mission_day()}
 
 @app.get("/api/v1/psych/mood/{crew_id}")
-async def get_mood(crew_id: str, days: int = 30):
+async def get_mood(crew_id: str, days: int = 30, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, crew_id, FLIGHT_SURGEON)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT * FROM mood_checkins WHERE crew_id=$1 ORDER BY mission_day DESC LIMIT $2",
@@ -310,7 +321,8 @@ async def get_mood(crew_id: str, days: int = 30):
     }
 
 @app.get("/api/v1/psych/mood/trend/{crew_id}")
-async def mood_trend(crew_id: str, days: int = 30):
+async def mood_trend(crew_id: str, days: int = 30, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, crew_id, FLIGHT_SURGEON)
     """Daily average mood score for trend chart."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -322,13 +334,13 @@ async def mood_trend(crew_id: str, days: int = 30):
     return [{"day": r["mission_day"], "score": round(float(r["avg_score"]), 2)} for r in rows]
 
 # ─── PSYCHOLOGICAL SURVEYS ────────────────────────────────────────────────────
-@app.get("/api/v1/psych/surveys")
+@app.get("/api/v1/psych/surveys", dependencies=[Depends(current_user)])
 async def list_surveys():
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT id, name, description, schedule_days FROM psych_survey_templates")
     return [dict(r) for r in rows]
 
-@app.get("/api/v1/psych/survey/{template_id}")
+@app.get("/api/v1/psych/survey/{template_id}", dependencies=[Depends(current_user)])
 async def get_survey(template_id: int):
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM psych_survey_templates WHERE id=$1", template_id)
@@ -336,7 +348,8 @@ async def get_survey(template_id: int):
     return dict(row)
 
 @app.post("/api/v1/psych/survey/submit")
-async def submit_survey(body: SurveyResponseIn):
+async def submit_survey(body: SurveyResponseIn, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, body.crew_id)
     async with pool.acquire() as conn:
         tmpl = await conn.fetchrow("SELECT * FROM psych_survey_templates WHERE id=$1", body.template_id)
         if not tmpl: raise HTTPException(404)
@@ -364,7 +377,8 @@ async def submit_survey(body: SurveyResponseIn):
     return {"response_id": rid, "total_score": round(score, 2), "subscores": subscores, "flagged": bool(flagged)}
 
 @app.get("/api/v1/psych/survey/history/{crew_id}")
-async def survey_history(crew_id: str):
+async def survey_history(crew_id: str, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, crew_id, FLIGHT_SURGEON)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT pr.*, pt.name FROM psych_survey_responses pr
@@ -375,7 +389,8 @@ async def survey_history(crew_id: str):
 
 # ─── SOCIOGRAM ────────────────────────────────────────────────────────────────
 @app.post("/api/v1/psych/sociogram")
-async def submit_rating(body: SociogramIn):
+async def submit_rating(body: SociogramIn, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, body.rater_id)
     if body.rater_id == body.ratee_id:
         raise HTTPException(400, "Cannot rate yourself")
     if body.comfort_score < 1 or body.comfort_score > 5:
@@ -391,7 +406,8 @@ async def submit_rating(body: SociogramIn):
     return {"status": "rating_stored"}
 
 @app.get("/api/v1/psych/sociogram/my-ratings/{crew_id}")
-async def my_outgoing_ratings(crew_id: str):
+async def my_outgoing_ratings(crew_id: str, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, crew_id)
     """Crew can see ratings THEY GAVE, never ratings they received."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -400,13 +416,10 @@ async def my_outgoing_ratings(crew_id: str):
         )
     return [dict(r) for r in rows]
 
-@app.get("/api/v1/psych/sociogram/aggregate")
-async def sociogram_aggregate(requester_id: str = Query(...)):
+@app.get("/api/v1/psych/sociogram/aggregate", dependencies=[Depends(require_roles(FLIGHT_SURGEON))])
+async def sociogram_aggregate():
     """Flight surgeon only — see all dyad ratings as network graph data."""
     async with pool.acquire() as conn:
-        role = await conn.fetchval("SELECT role FROM users WHERE username=$1", requester_id)
-        if role != "flight_surgeon":
-            raise HTTPException(403, "Flight surgeon access only")
         rows = await conn.fetch(
             """SELECT rater_id, ratee_id, AVG(comfort_score) as avg_score, COUNT(*) as n_ratings
                FROM sociogram_ratings GROUP BY rater_id, ratee_id"""
@@ -421,11 +434,9 @@ async def sociogram_aggregate(requester_id: str = Query(...)):
 
 # ─── TRENDS (Flight Surgeon 30-day) ──────────────────────────────────────────
 @app.get("/api/v1/psych/trends/{crew_id}")
-async def crew_trends(crew_id: str, requester_id: str = Query(...)):
+async def crew_trends(crew_id: str, user: User = Depends(current_user)):
+    ensure_self_or_roles(user, crew_id, FLIGHT_SURGEON)
     async with pool.acquire() as conn:
-        role = await conn.fetchval("SELECT role FROM users WHERE username=$1", requester_id)
-        if role != "flight_surgeon" and requester_id != crew_id:
-            raise HTTPException(403, "Access denied")
         start_day = mission_day() - 30
         mood = await conn.fetch(
             "SELECT mission_day, AVG(score) avg FROM mood_checkins WHERE crew_id=$1 AND mission_day>=$2 GROUP BY mission_day ORDER BY mission_day",
@@ -446,7 +457,7 @@ async def crew_trends(crew_id: str, requester_id: str = Query(...)):
         "workload_trend": [{"day": r["mission_day"], "score": float(r["total_score"])} for r in workload],
     }
 
-@app.get("/api/v1/psych/trigger-sleep-alert")
+@app.get("/api/v1/psych/trigger-sleep-alert", dependencies=[Depends(require_roles(FLIGHT_SURGEON, COMMANDER))])
 async def manual_sleep_alert():
     await check_sleep_deprivation()
     return {"status": "sleep_alert_check_complete"}
