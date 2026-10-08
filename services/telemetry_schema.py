@@ -130,6 +130,8 @@ class TelemetryPayload(BaseModel):
     wifi_drops: Optional[int] = Field(None, ge=0)             # Wi-Fi link losses since boot
     wifi_reason: Optional[int] = Field(None, ge=0, le=1023)   # why the link last dropped (ESP-IDF wifi_err_reason_t)
     net_restarts: Optional[int] = Field(None, ge=0)           # web server + mDNS restarts (not polled) since boot
+    usb_link: Optional[int] = Field(None, ge=0, le=1)         # board read over USB and Wi-Fi: USB delivering
+    wifi_link: Optional[int] = Field(None, ge=0, le=1)        # … and Wi-Fi delivering
     # radiation (external board)
     cpm: Optional[float] = Field(None, ge=0, le=1_000_000)    # counts per minute (60 s window)
     usv_h: Optional[float] = Field(None, ge=0, le=100_000)    # dose rate, µSv/h
@@ -171,7 +173,8 @@ SENSOR_METRICS: Dict[str, List[str]] = {
                "grav_ms2", "mag_ut", "gyro_dps", "temp", "calib_gyro", "calib_acc", "calib_mag", "cal_restored"],
     "mq4": ["ch4_ppm", "rs_r0", "vout_mv", "rs_rl", "warming", "calibrated", "warm_left_s"],
     "board": ["uptime_s", "reset_reason", "boot_count", "i2c_err", "bme_resets", "rssi_dbm",
-              "heal_cause", "heal_reboots", "heap_free", "heap_min", "wifi_drops", "wifi_reason", "net_restarts"],
+              "heal_cause", "heal_reboots", "heap_free", "heap_min", "wifi_drops", "wifi_reason", "net_restarts",
+              "usb_link", "wifi_link"],
     "geiger": ["cpm", "usv_h", "counts", "warming", "window_s"],
     "gnss": ["fix", "sats", "lat", "lon", "alt_m", "sog_kn", "cog_deg"],
 }
@@ -181,7 +184,8 @@ STATE_METRICS = {"warming", "calibrated", "warm_left_s", "cal_restored", "asc", 
                  "undervolt", "throttled", "undervolt_boot", "svc_failed", "svc_restarts", "mcc_link",
                  "mqtt_backlog", "uptime_s", "reset_reason", "boot_count", "i2c_err", "bme_resets",
                  "rssi_dbm", "counts", "fix", "sats", "lat", "lon", "alt_m", "sog_kn", "cog_deg",
-                 "heal_cause", "heal_reboots", "heap_free", "heap_min", "wifi_drops", "wifi_reason", "net_restarts"}
+                 "heal_cause", "heal_reboots", "heap_free", "heap_min", "wifi_drops", "wifi_reason", "net_restarts",
+                 "usb_link", "wifi_link"}
 
 # ESP32 sensor board: esp_reset_reason_t values worth a word, and the firmware's own reboots
 RESET_REASONS = {1: "power-on", 2: "RESET button", 3: "software", 4: "crash", 5: "interrupt watchdog",

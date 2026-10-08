@@ -272,6 +272,21 @@ def test_board_self_heal_reboot_names_its_cause():
     assert "restarted (self-heal reboot: Wi-Fi lost), 1 time(s) in 15 min" in a.message
 
 
+def test_board_on_both_links_says_when_one_goes_silent():
+    mon = HealthMonitor()
+    t = T0
+    for usb, wifi in ((1, 1), (1, 0)):
+        mon.ingest_reading({"data": {"sensor": "board", "node_id": "node-rpi-01", "zone": "zone_a", "timestamp": t,
+                                     "q": "good", "qf": [], "uptime_s": 100, "bme_resets": 0, "boot_count": 7,
+                                     "reset_reason": 1, "i2c_err": 0, "usb_link": usb, "wifi_link": wifi}}, t)
+        mon.tick(t)
+        t += 10
+    keys = {a.key: a for a in mon.alarms.open()}
+    a = keys["board.node-rpi-01.zone_a.wifi_link"]
+    assert a.severity == "advisory" and "Wi-Fi link silent, readings carried by the USB cable only" in a.message
+    assert "board.node-rpi-01.zone_a.usb_link" not in keys
+
+
 def test_component_safe_mode_and_silence():
     mon = HealthMonitor()
     mon.ingest_component({"state": "SAFE", "reason": "no fresh temperature/humidity: relays OFF", "interval_s": 60},

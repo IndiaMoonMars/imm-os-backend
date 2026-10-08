@@ -247,6 +247,12 @@ class Rules:
             c[f"board.{k.node}.{k.zone}.bme_resets"] = Condition(
                 "caution", "power", k.id(),
                 f"ESP32 board on {k.node}: BME280 lost power {bme} times in 15 min: check the board's supply and the BME280's VIN/GND")
+        # A board read over its USB cable and Wi-Fi at once still delivers with one link down: say which
+        for name, what, other in (("usb_link", "USB cable", "Wi-Fi"), ("wifi_link", "Wi-Fi", "the USB cable")):
+            if s.last.get(name) == 0:
+                c[f"board.{k.node}.{k.zone}.{name}"] = Condition(
+                    "advisory", "node", k.id(),
+                    f"ESP32 board on {k.node} ({k.zone}): {what} link silent, readings carried by {other} only")
         boots = [e for e in ev if e[1] == "boot"]
         if boots:
             _, _, reason, heal = boots[-1]
